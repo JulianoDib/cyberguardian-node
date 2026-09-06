@@ -1,0 +1,19 @@
+{
+  "name": "cyberguardian-node",
+  "version": "1.0.0",
+  "description": "NIDS distribuido (Tema 10 - PDP/Multivix): Gateway TCP, Kafka, workers com Relogio de Lamport e eleicao Bully.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "typescript": "^7.0.2"
+  }
+}
