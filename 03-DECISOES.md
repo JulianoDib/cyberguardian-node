@@ -170,3 +170,83 @@
 - Decisão: `src/compartilhado/` (contrato de mensagem e conexão Kafka, usados por todos os processos) e `src/testes/` (scripts de verificação manual).
 - Motivo: se o contrato morasse dentro da pasta do gateway, os workers teriam que importar "de dentro" do gateway — dependência invertida, ruim de explicar.
 - Nota: `src/testes/` contém scripts de verificação **manual**, executados à mão. Não são testes automatizados (explicitamente fora do escopo).
+
+---
+
+## Etapa 2 — R1: Ponto de Entrada (Gateway TCP)
+
+### 06/09 — Pasta `demonstracoes/` versionada como evidência de defesa
+- Contexto: antes de implementar o framing, foram escritos dois scripts para *ver* o problema acontecer — um servidor TCP sem enquadramento sofrendo aglutinação e fragmentação, e o par mostrando os mesmos cenários resolvidos.
+- Decisão: **guardar os dois no repositório**, em `demonstracoes/`, fora de `src/`.
+- Justificativa: o critério de defesa "Fundamentação e Decisões de Arquitetura" (0,5) cobra justificar trade-offs. Poder responder "por que framing explícito?" com números medidos — 3 alertas de 69 bytes chegando grudados numa leitura de 207; 1 alerta de 300 KB picado em 5 leituras de 64 KB; 100% de falha no `JSON.parse` nos dois casos — vale mais que uma explicação teórica.
+- Cuidados tomados para não confundir com código de produção:
+  - ficam **fora de `src/`**, então não entram na compilação do `tsc`;
+  - cabeçalho no topo de cada arquivo em caixa alta: "MATERIAL DE DEMONSTRACAO — NAO FAZ PARTE DO SISTEMA EM PRODUCAO";
+  - nenhum módulo do gateway, dos workers ou do sensor os importa (a dependência é no sentido oposto: o demo é que usa o `framing` real do projeto).
+- Correção aplicada ao mover: o `solucao-com-framing.mjs` importava o framing por **caminho absoluto** (`C:/Users/Julia/...`), o que quebraria na máquina 2 e na do professor. Trocado por caminho relativo `../dist/compartilhado/framing.js`.
+- Atalhos: `npm run demo:problema` e `npm run demo:solucao`.
+- Alternativa descartada: deixá-los fora do repositório (pasta temporária). Perderíamos a evidência justamente na hora da arguição.
+
+### 06/09 — Framing por prefixo de tamanho (4 bytes) + JSON UTF-8
+- Contexto: o TCP entrega um fluxo de bytes, não de mensagens. As leituras não correspondem às escritas do outro lado.
+- Evidência medida antes de decidir (`demonstracoes/problema-sem-framing.mjs`): 3 alertas de 69 bytes chegaram **grudados numa leitura de 207 bytes** (aglutinação), e 1 alerta de 300.070 bytes chegou **picado em 5 leituras** de 65.536/65.536/65.536/65.536/37.926 (fragmentação). Nos dois casos, **100% de falha** no `JSON.parse` — 6 leituras, 6 erros, 0 mensagens recuperadas.
+- Decisão: cada quadro = 4 bytes de tamanho (inteiro sem sinal, big-endian) + N bytes de JSON em UTF-8. Teto de 1 MB por quadro.
+- Alternativas descartadas:
+  - **Delimitador `\n` (NDJSON)** — funcionaria, porque `JSON.stringify` já escapa quebras de linha internas, então não haveria colisão. Descartado por dois motivos: (a) com prefixo, o tamanho é conhecido **antes** de receber o corpo, o que permite recusar quadros abusivos sem alocar memória; (b) o enunciado pede framing *explícito*, e o tamanho como campo é mais explícito que "leia até achar o marcador". **Registrar que NDJSON não está errado** — é escolha de trade-off, não de correção.
+  - **Tamanho fixo** — desperdiça espaço e engessa o payload.
+- Verificação (`demonstracoes/solucao-com-framing.mjs`): os mesmos cenários passam a 100%; alimentado **byte a byte**, o decodificador só entrega a mensagem no byte 52 de 52; e um cabeçalho anunciando 2 GB é recusado lendo apenas 4 bytes.
+- Custo do enquadramento: 69 → 73 bytes na mensagem pequena; 300.070 → 300.074 na grande.
+
+### 06/09 — ACK enviado APÓS a confirmação do Kafka
+- Contexto: duas opções — responder na hora e publicar em segundo plano, ou publicar e só então responder.
+- Decisão: **ACK após o Kafka confirmar**.
+- Justificativa: o escopo fala em "ACK de enfileiramento"; um ACK enviado antes da confirmação poderia **mentir** ao sensor se a publicação falhasse em seguida. Continua sendo non-blocking no sentido que importa: o sensor não espera o *processamento* (a análise do worker), e o gateway não trava para outros sensores enquanto aguarda o broker.
+- Medição: latência de 43 a 53 ms por alerta (média 48 ms) em rajada de 5, com Kafka local.
+- Alternativa descartada: ACK imediato — ganharia poucos milissegundos ao custo de um ACK potencialmente falso, difícil de defender oralmente.
+
+### 06/09 — Serialização do processamento POR CONEXÃO (seção crítica do gateway)
+- Contexto: o tratador de `data` é assíncrono (aguarda o Kafka). Dois quadros chegando em sequência teriam publicações disparadas em paralelo.
+- Problema evitado: as gravações poderiam chegar **fora de ordem** na partição, destruindo a ordenação por atacante que a chave da mensagem garante.
+- Decisão: encadear promessas (`fila = fila.then(...)`) — uma fila por socket.
+- Impacto: ordena **dentro** de cada conexão sem bloquear as demais; conexões diferentes seguem atendidas em paralelo pelo event loop. É a seção crítica concreta do gateway — resposta pronta para a pergunta "onde está a race condition?".
+- Evidência: 5 alertas enviados em rajada foram enfileirados na ordem exata 1→5 no log do gateway.
+
+### 06/09 — Divisão de responsabilidade: sensor manda ALERTA, gateway monta o ENVELOPE
+- Decisão: o sensor envia apenas o `AlertaAnomalia`; o gateway gera `id`, `correlacaoId`, `emitidoEm` e o carimbo de Lamport.
+- Justificativa: o identificador único e os metadados causais são responsabilidade do Ponto de Entrada, não de um cliente externo (que poderia repetir ids). E na Etapa 4 a mudança de Lamport fica **local ao gateway**.
+- Consequência: `origemId` do envelope é `"gateway"`; o sensor de origem continua identificado dentro do payload, em `sensorId`.
+
+### 06/09 — Validação da entrada com type guard (`ehAlertaAnomalia`)
+- Contexto: `JSON.parse` devolve algo sem nenhuma garantia de formato. Sem verificação em execução, a tipagem estática seria ficção na fronteira da rede.
+- Decisão: type guard (`valor is AlertaAnomalia`) checando tipo de cada campo, valor do enum `protocolo` e `Number.isFinite` nos numéricos.
+- Impacto: alerta fora do contrato recebe `{"tipo":"ERRO","motivo":"alerta fora do contrato esperado"}` e o gateway segue vivo.
+
+### 06/09 — Protocolo de resposta como união discriminada
+- Decisão: `RespostaGateway = AckEnfileiramento | ErroGateway`, discriminadas pelo campo `tipo`.
+- Justificativa: o TypeScript estreita o tipo sozinho ao testar `resposta.tipo === "ACK"`, tornando impossível ler um campo que não existe naquele ramo. Serve ao critério de tipagem rigorosa.
+
+### 06/09 — Tratamento de falhas do gateway (critério "exceções e timeouts robustos")
+- Decisões e o que cada uma protege:
+  - **JSON inválido** → responde ERRO, mantém a conexão (é erro de conteúdo, o fluxo segue alinhado).
+  - **Alerta fora do contrato** → responde ERRO, mantém a conexão.
+  - **Violação de framing** → responde ERRO e **derruba a conexão**: perdido o alinhamento do fluxo, não há como reencontrá-lo.
+  - **Falha ao publicar no Kafka** → responde ERRO genérico ao sensor; o detalhe fica no log do servidor (não vaza interno para o cliente).
+  - **Timeout de ociosidade (30 s)** → derruba conexões mortas; sem isso, uma conexão meio-aberta prenderia socket e memória para sempre.
+  - **`error` de socket** → registrado em log, nunca derruba o gateway.
+  - **`.catch()` na fila de processamento** → uma falha inesperada não trava o restante da fila daquela conexão.
+- Verificação: os quatro casos foram testados manualmente com o gateway no ar. Após os três erros seguidos, um alerta válido foi aceito normalmente (ACK, partição 0) — o gateway sobreviveu a todos.
+
+### 06/09 — `src/compartilhado/rede.ts` para os parâmetros de rede
+- Decisão: `HOST_GATEWAY`, `PORTA_GATEWAY` (5000) e `TIMEOUT_OCIOSIDADE_MS` num módulo próprio.
+- Motivo: o simulador de sensor precisa do endereço do gateway. Importá-lo de `gateway/servidor.ts` faria o módulo do **servidor ser executado** ao ser importado — o servidor subiria junto com o sensor.
+
+### 06/09 — Módulo de framing separado (`src/compartilhado/framing.ts`)
+- Decisão: framing em arquivo próprio, e não embutido no gateway.
+- Motivo: custo zero (é só escolher um nome de arquivo) e separação honesta de responsabilidade — o framing não sabe nada sobre Kafka nem sobre alertas.
+- Nota, sem antecipar desenho: se a Etapa 5 (Bully) usar sockets entre workers, este módulo provavelmente serve sem alteração. **Nenhuma generalização foi feita para isso.**
+
+### 06/09 — ACHADO OPERACIONAL: recriar o container exige recriar o tópico
+- Contexto: durante o teste ponta a ponta, os offsets recomeçaram do zero e o erro transitório do `GroupCoordinator` reapareceu. Investigado com `docker inspect` e `kafka-get-offsets.sh`: o container foi **criado hoje às 16:08Z** (`RestartCount: 0`), e o tópico contém apenas as mensagens desta sessão — as da Etapa 1 (04:02Z) se perderam.
+- Diagnóstico: é a consequência esperada e já documentada da decisão de **fila efêmera** (sem volume). Não é defeito novo.
+- **Porém, gera um requisito operacional:** como `auto.create.topics.enable=false`, depois de um `docker compose down` o tópico precisa ser **recriado manualmente**, senão o gateway falha ao publicar. Isso precisa entrar no guia de execução do README (Etapa 9) ou ser automatizado no compose.
+- Pendência registrada em 04-PROGRESSO.md.

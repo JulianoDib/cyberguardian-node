@@ -6,8 +6,8 @@
 
 ## Estado atual
 **Fase:** Desenvolvimento iniciado.
-**Etapa atual:** Etapa 1 (R2/Kafka) CONCLUIDA. Proxima: Etapa 2 (R1 - Gateway TCP).
-**Última atualização:** 06/09/2026 — sessão de trabalho: Kafka rodando, contrato da mensagem definido, produtor/consumidor de teste validados ponta a ponta.
+**Etapa atual:** Etapa 2 (R1/Gateway TCP) CONCLUIDA. Proxima: Etapa 3 (R3 - 3 workers).
+**Última atualização:** 06/09/2026 — sessão de trabalho: Gateway TCP com framing, ACK apos confirmacao do Kafka, simulador de sensor. Fluxo sensor->gateway->Kafka validado.
 
 ## Checklist de etapas
 - [x] Análise do enunciado e divisão em etapas
@@ -30,7 +30,16 @@
   - [x] Contrato da mensagem em `src/compartilhado/tipos.ts`, **com campo `lamport` ja presente**
   - [x] Produtor e consumidor de teste rodando (`npm run teste:produtor` / `teste:consumidor`)
   - [x] **Mensagem viajou ponta a ponta** — mesmo UUID publicado e recebido
-- [ ] Etapa 2 — R1: Gateway TCP com framing + ACK + simulador de sensor
+- [x] Etapa 2 — R1: Gateway TCP com framing + ACK + simulador de sensor — **CONCLUIDA**
+  - [x] `src/compartilhado/framing.ts` — prefixo de tamanho (4 bytes) + JSON UTF-8, teto de 1 MB
+  - [x] `src/gateway/servidor.ts` — servidor TCP, publica no Kafka, ACK **apos** confirmacao
+  - [x] `src/sensor/simulador.ts` — cliente TCP que envia alertas em rajada e mede latencia
+  - [x] `src/compartilhado/rede.ts` — host/porta/timeout
+  - [x] Validacao de entrada com type guard + uniao discriminada ACK/ERRO
+  - [x] Serializacao por conexao (ordem preservada dentro de cada socket)
+  - [x] `demonstracoes/` — prova medida do problema que o framing resolve
+  - [x] **Fluxo ponta a ponta validado:** 5 alertas -> 5 ACK (43-53 ms) -> 5 mensagens no Kafka
+  - [x] **4 caminhos de erro testados:** JSON invalido, fora do contrato, quadro de 2 GB, e alerta valido depois (gateway sobreviveu)
 - [ ] Etapa 3 — R3: 3 workers em Competing Consumers
 - [ ] Etapa 4 — R4: Relógios de Lamport nos logs de auditoria
 - [ ] Etapa 5 — R5: Eleição Bully + líder único consolidador
@@ -38,6 +47,13 @@
 - [ ] Etapa 7 — Persistência primário + réplica
 - [ ] Etapa 8 — Integração ponta a ponta + coleta de evidências de log
 - [ ] Etapa 9 — README, diagrama, Declaração de IA, e-mail de submissão
+
+## Pendências técnicas em aberto
+- [ ] **Recriar o tópico após `docker compose down`.** Com `auto.create.topics.enable=false`, o tópico
+  não volta sozinho e o gateway falha ao publicar. Precisa entrar no guia do README (Etapa 9) ou ser
+  automatizado no docker-compose. Comando atual:
+  `docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --create --topic alertas-anomalia --partitions 3 --replication-factor 1 --bootstrap-server localhost:9092`
+- [ ] `src/index.ts` ainda é o arquivo placeholder da Etapa 0; remover quando não fizer mais falta.
 
 ## Pendências externas (não dependem de código)
 - [ ] Confirmar linguagem com o professor (assumindo TypeScript/Node)
@@ -51,7 +67,19 @@
 2. Conferir a etapa atual no checklist e o critério de "pronto" dela no 02-PLANO.md.
 3. Perguntar ao aluno como ele quer conduzir a etapa (manual, misto ou delegado) e seguir.
 
-## Notas da última sessão (06/09 — Etapa 1 concluída)
+## Notas da última sessão (06/09 — Etapa 2 concluída)
+- **Fluxo real funcionando:** `npm run gateway` num terminal, `npm run sensor -- 5` noutro. Os 5 UUIDs
+  do ACK batem com os 5 recebidos pelo consumidor de teste lendo do Kafka.
+- **Ordenação por atacante comprovada:** `203.0.113.45` caiu 3x na partição 2 (offsets 0,1,2) e
+  `198.51.100.9` caiu 2x na partição 1 (offsets 0,1) — cada atacante numa partição só, em ordem.
+- **Antes de implementar o framing, o problema foi medido** e guardado em `demonstracoes/`:
+  sem enquadramento, 6 leituras geraram 6 falhas de JSON.parse e 0 mensagens.
+- Latência medida do ACK: 43-53 ms (média 48 ms), em rajada de 5 alertas.
+- Achado operacional registrado nas pendências: recriar o container exige recriar o tópico.
+- Comandos da etapa: `docker compose up -d` -> `npm run build` -> `npm run gateway` | `npm run sensor -- 5`
+  Demos de defesa: `npm run demo:problema` e `npm run demo:solucao`.
+
+## Notas da sessão anterior (06/09 — Etapa 1 concluída)
 - **Prova de que o Kafka funciona:** produtor publicou o envelope `a8643768-d5a1-427f-9f29-bb7d52f682d1`
   na partição 2; consumidor leu exatamente esse id, offset 2. A armadilha do `advertised.listeners`
   está vencida — cliente rodando no Windows fala com broker dentro do container.

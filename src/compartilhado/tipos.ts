@@ -98,3 +98,76 @@ export interface Envelope<TPayload> {
 
 /** Atalho para o unico tipo de envelope em uso nesta etapa. */
 export type EnvelopeAlerta = Envelope<AlertaAnomalia>;
+
+// ---------------------------------------------------------------------------
+// RESPOSTAS DO GATEWAY AO SENSOR — protocolo do Ponto de Entrada (R1)
+// ---------------------------------------------------------------------------
+
+/**
+ * ACK DE ENFILEIRAMENTO: o alerta ja esta na fila do Kafka.
+ *
+ * So e enviado DEPOIS que o broker confirma a gravacao. Um ACK enviado antes
+ * disso poderia mentir para o sensor se a publicacao falhasse em seguida.
+ */
+export interface AckEnfileiramento {
+  readonly tipo: "ACK";
+  /** Id do envelope gerado pelo gateway (o sensor nao o conhecia antes). */
+  readonly id: string;
+  /** Particao em que o Kafka gravou — util para evidenciar o R3 nos logs. */
+  readonly particao: number;
+  /** Posicao da mensagem dentro da particao. */
+  readonly offset: string;
+}
+
+/** Recusa: o alerta NAO foi enfileirado. */
+export interface ErroGateway {
+  readonly tipo: "ERRO";
+  readonly motivo: string;
+}
+
+/**
+ * Uniao DISCRIMINADA pelo campo `tipo`.
+ *
+ * Ao testar `resposta.tipo === "ACK"`, o TypeScript estreita o tipo sozinho e
+ * libera o acesso a `id`/`particao`/`offset`; no ramo do erro, so `motivo`
+ * existe. Isso torna impossivel ler um campo que nao esta ali.
+ */
+export type RespostaGateway = AckEnfileiramento | ErroGateway;
+
+// ---------------------------------------------------------------------------
+// VALIDACAO DE ENTRADA NAO CONFIAVEL
+// ---------------------------------------------------------------------------
+
+const PROTOCOLOS_VALIDOS: readonly string[] = ["TCP", "UDP", "ICMP"];
+
+/**
+ * Confirma que um valor vindo da rede tem mesmo o formato de AlertaAnomalia.
+ *
+ * `JSON.parse` devolve algo sem nenhuma garantia de formato: um sensor com
+ * defeito pode mandar campos faltando ou com o tipo errado. Esta funcao e um
+ * "type guard" — o `valor is AlertaAnomalia` no retorno faz o TypeScript
+ * tratar o valor como AlertaAnomalia apenas dentro do ramo verdadeiro.
+ *
+ * Sem isso, a tipagem estatica seria uma ficcao na fronteira da rede: o
+ * compilador acreditaria num contrato que ninguem verificou em execucao.
+ */
+export function ehAlertaAnomalia(valor: unknown): valor is AlertaAnomalia {
+  if (typeof valor !== "object" || valor === null) {
+    return false;
+  }
+
+  const campos = valor as Record<string, unknown>;
+
+  return (
+    typeof campos["sensorId"] === "string" &&
+    typeof campos["ipOrigem"] === "string" &&
+    typeof campos["ipDestino"] === "string" &&
+    typeof campos["protocolo"] === "string" &&
+    PROTOCOLOS_VALIDOS.includes(campos["protocolo"]) &&
+    typeof campos["pacotesPorSegundo"] === "number" &&
+    Number.isFinite(campos["pacotesPorSegundo"]) &&
+    typeof campos["bytesPorSegundo"] === "number" &&
+    Number.isFinite(campos["bytesPorSegundo"]) &&
+    typeof campos["detectadoEm"] === "string"
+  );
+}
