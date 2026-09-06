@@ -12,7 +12,8 @@
     "demo:problema": "node demonstracoes/problema-sem-framing.mjs",
     "demo:solucao": "node demonstracoes/solucao-com-framing.mjs",
     "gateway": "node --disable-warning=TimeoutNegativeWarning dist/gateway/servidor.js",
-    "sensor": "node --disable-warning=TimeoutNegativeWarning dist/sensor/simulador.js"
+    "sensor": "node --disable-warning=TimeoutNegativeWarning dist/sensor/simulador.js",
+    "worker": "node --disable-warning=TimeoutNegativeWarning dist/worker/worker.js"
   },
   "keywords": [],
   "author": "",

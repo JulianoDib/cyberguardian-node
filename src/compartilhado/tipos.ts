@@ -171,3 +171,42 @@ export function ehAlertaAnomalia(valor: unknown): valor is AlertaAnomalia {
     typeof campos["detectadoEm"] === "string"
   );
 }
+
+/**
+ * Confirma que um valor lido DA FILA tem mesmo o formato de EnvelopeAlerta.
+ *
+ * Mesma razao do `ehAlertaAnomalia`: o conteudo do topico e apenas um texto ate
+ * ser verificado. O worker nao pode confiar cegamente no que esta na fila — a
+ * mensagem pode ter sido gravada por uma versao antiga do gateway, ou estar
+ * truncada. Sem esta checagem, a tipagem estatica seria ficcao na fronteira.
+ */
+export function ehEnvelopeAlerta(valor: unknown): valor is EnvelopeAlerta {
+  if (typeof valor !== "object" || valor === null) {
+    return false;
+  }
+
+  const campos = valor as Record<string, unknown>;
+
+  if (typeof campos["id"] !== "string") {
+    return false;
+  }
+
+  if (!ehAlertaAnomalia(campos["payload"])) {
+    return false;
+  }
+
+  const metadados = campos["metadados"];
+  if (typeof metadados !== "object" || metadados === null) {
+    return false;
+  }
+
+  const meta = metadados as Record<string, unknown>;
+
+  return (
+    typeof meta["origemId"] === "string" &&
+    typeof meta["lamport"] === "number" &&
+    typeof meta["emitidoEm"] === "string" &&
+    typeof meta["correlacaoId"] === "string" &&
+    (meta["causaId"] === null || typeof meta["causaId"] === "string")
+  );
+}

@@ -6,8 +6,8 @@
 
 ## Estado atual
 **Fase:** Desenvolvimento iniciado.
-**Etapa atual:** Etapa 2 (R1/Gateway TCP) CONCLUIDA. Proxima: Etapa 3 (R3 - 3 workers).
-**Última atualização:** 06/09/2026 — sessão de trabalho: Gateway TCP com framing, ACK apos confirmacao do Kafka, simulador de sensor. Fluxo sensor->gateway->Kafka validado.
+**Etapa atual:** Etapa 3 (R3/Workers) CONCLUIDA. Proxima: Etapa 4 (R4 - Relogios de Lamport).
+**Última atualização:** 06/09/2026 — sessão de trabalho: 3 workers em Competing Consumers, ack manual, regra de bloqueio em duas camadas.
 
 ## Checklist de etapas
 - [x] Análise do enunciado e divisão em etapas
@@ -40,7 +40,14 @@
   - [x] `demonstracoes/` — prova medida do problema que o framing resolve
   - [x] **Fluxo ponta a ponta validado:** 5 alertas -> 5 ACK (43-53 ms) -> 5 mensagens no Kafka
   - [x] **4 caminhos de erro testados:** JSON invalido, fora do contrato, quadro de 2 GB, e alerta valido depois (gateway sobreviveu)
-- [ ] Etapa 3 — R3: 3 workers em Competing Consumers
+- [x] Etapa 3 — R3: 3 workers em Competing Consumers — **CONCLUIDA**
+  - [x] `src/worker/worker.ts` — consumidor com groupId unico `workers-nids`
+  - [x] `src/worker/regra-bloqueio.ts` — regra em 2 camadas (limiar + janela deslizante)
+  - [x] **ACK MANUAL** (`autoCommit: false`) — antecipado da Etapa 6 de proposito
+  - [x] Mensagem envenenada tratada (erro permanente confirma; transitorio nao)
+  - [x] `ehEnvelopeAlerta` — validacao do que vem da fila
+  - [x] **Evidencia:** 12 alertas divididos 6/4/2 entre os 3 workers, LAG 0 nas 3 particoes
+  - [x] **Rebalanceamento em cadeia capturado:** [0,1,2] -> [0,1] -> [1] conforme os workers entravam
 - [ ] Etapa 4 — R4: Relógios de Lamport nos logs de auditoria
 - [ ] Etapa 5 — R5: Eleição Bully + líder único consolidador
 - [ ] Etapa 6 — R6: Falhas sem perda + reeleição automática
@@ -67,7 +74,24 @@
 2. Conferir a etapa atual no checklist e o critério de "pronto" dela no 02-PLANO.md.
 3. Perguntar ao aluno como ele quer conduzir a etapa (manual, misto ou delegado) e seguir.
 
-## Notas da última sessão (06/09 — Etapa 2 concluída)
+## Notas da última sessão (06/09 — Etapa 3 concluída)
+- **Competing Consumers provado:** 12 alertas, cada um processado por exatamente um worker.
+  worker-1 = particao 1 (6 msgs), worker-2 = particao 2 (4), worker-3 = particao 0 (2).
+- **Prova pelo lado do Kafka:** `kafka-consumer-groups.sh --describe --group workers-nids` mostrou
+  3 CONSUMER-ID distintos, um por particao, com CURRENT-OFFSET == LOG-END-OFFSET e **LAG 0**.
+  Isso e o ack manual se provando: o que foi confirmado bate exatamente com o que foi produzido.
+- **Cada atacante caiu inteiro num worker so** (efeito da chave `ipOrigem` escolhida na Etapa 2):
+  198.51.100.9 -> worker-1, 203.0.113.45 -> worker-2, 192.0.2.77 -> worker-3. E por isso que a
+  contagem local da janela deslizante esta correta sem coordenacao entre processos.
+- **A regra em 2 camadas compondo:** worker-2 recebeu 19675 pac/s, classificou NORMAL e NAO
+  incrementou o contador — o alerta seguinte apareceu como "2/3", nao "3/3".
+- **Decisao consciente: sem mutex.** Nao ha memoria compartilhada entre workers; a exclusao mutua
+  vem da atribuicao de particoes do Kafka. A secao critica real e local (o Map da janela) e e
+  atomica por ser sincrona. Verificado no codigo da kafkajs que ela ja serializa por padrao
+  (partitionsConsumedConcurrently = 1), mas nao dependemos disso.
+- Comandos: `npm run worker -- 1` / `-- 2` / `-- 3` em 3 terminais, `npm run gateway`, `npm run sensor -- 12`.
+
+## Notas da sessão anterior (06/09 — Etapa 2 concluída)
 - **Fluxo real funcionando:** `npm run gateway` num terminal, `npm run sensor -- 5` noutro. Os 5 UUIDs
   do ACK batem com os 5 recebidos pelo consumidor de teste lendo do Kafka.
 - **Ordenação por atacante comprovada:** `203.0.113.45` caiu 3x na partição 2 (offsets 0,1,2) e

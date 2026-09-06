@@ -250,3 +250,62 @@
 - Diagnóstico: é a consequência esperada e já documentada da decisão de **fila efêmera** (sem volume). Não é defeito novo.
 - **Porém, gera um requisito operacional:** como `auto.create.topics.enable=false`, depois de um `docker compose down` o tópico precisa ser **recriado manualmente**, senão o gateway falha ao publicar. Isso precisa entrar no guia de execução do README (Etapa 9) ou ser automatizado no compose.
 - Pendência registrada em 04-PROGRESSO.md.
+
+---
+
+## Etapa 3 — R3: Workers replicados (Competing Consumers)
+
+### 06/09 — Consumer group único `workers-nids` para os 3 workers
+- Decisão: os três processos declaram o **mesmo** `groupId`.
+- Justificativa: é esse campo que faz o Kafka **dividir** o trabalho, atribuindo cada partição a exatamente um consumidor do grupo. Nenhuma mensagem é processada duas vezes.
+- Alternativa descartada: `groupId` diferente por worker — cada um receberia **todas** as mensagens (publish/subscribe). Seria processamento triplicado, não divisão de trabalho.
+- Evidência medida: com os 3 no ar, `kafka-consumer-groups.sh --describe` mostrou partições 0, 1 e 2 com três `CONSUMER-ID` distintos e **LAG 0** em todas.
+
+### 06/09 — ACK MANUAL (`autoCommit: false`) implementado JÁ nesta etapa
+- Contexto: o 02-PLANO.md previa isso para a Etapa 6. Antecipado deliberadamente.
+- Justificativa da antecipação: ack manual não é recurso que se acrescenta depois — é **como o laço de consumo é escrito**. Deixar para a Etapa 6 significaria reescrever o núcleo do worker com Lamport (Etapa 4) e Bully (Etapa 5) já empilhados em cima.
+- Como funciona: o offset só é confirmado **depois** do processamento concluído, via `commitOffsets`. Com a confirmação automática (padrão), a biblioteca salva o offset periodicamente em segundo plano, sem saber se o processamento terminou — se o worker morresse nessa janela, o Kafka consideraria a mensagem lida e nunca mais a entregaria (perda silenciosa).
+- **Armadilha do `+1`:** o Kafka guarda o offset da **próxima** mensagem a ler, não o da última processada. Commitar `message.offset` faria o worker reler a mesma mensagem em laço infinito. Usamos `BigInt(offset) + 1n` (BigInt porque offsets do Kafka são inteiros de 64 bits).
+- **Garantia obtida: at-least-once, não exactly-once.** Existe janela real: processar com sucesso e morrer antes de commitar faz a mensagem voltar. É por isso que o envelope carrega `id` único desde a Etapa 1. Resposta honesta para a defesa: *"duplicata acontece por desenho; escolhemos at-least-once porque perder alerta de ataque é pior que processar duas vezes, e o `id` permite identificar a repetição."*
+
+### 06/09 — Mensagem envenenada: erro permanente é confirmado e descartado
+- Contexto: o ack manual protege contra perda, mas cria o risco oposto — uma mensagem que **nunca** pode ser processada e nunca é confirmada **trava a partição inteira**, em laço infinito de reentrega.
+- Decisão: separar dois casos no worker.
+  - **Erro permanente** (sem conteúdo, JSON inválido, envelope fora do contrato): registra em log, **confirma o offset** e descarta. Reprocessar não ajudaria.
+  - **Erro transitório** (falha inesperada no processamento): **não confirma**, deixando a mensagem pendente para reentrega numa próxima atribuição da partição.
+- Alternativa descartada: tópico de dead-letter para as descartadas — fora do escopo do trabalho.
+
+### 06/09 — SEÇÃO CRÍTICA: nenhum mutex, e o motivo (ponto de defesa)
+- **Onde NÃO há contenção:** entre os 3 workers não existe memória compartilhada — são processos separados do sistema operacional. Um mutex entre eles seria não só decorativo, seria impossível sem coordenador externo. E dois workers nunca recebem a mesma mensagem, porque cada partição pertence a um único consumidor do grupo.
+- **Formulação para a arguição:** *a exclusão mútua do sistema existe, mas está na arquitetura, não no código* — quem serializa o acesso às mensagens é a atribuição de partições do Kafka.
+- **Onde HÁ contenção de verdade:** dentro de um worker, no `Map` de janela deslizante por IP (`historicoPorIp`), cujo padrão de acesso é ler → modificar → escrever. O Node é single-thread mas **concorrente**: um `await` entre a leitura e a escrita abriria a corrida clássica *check-then-act*.
+- **Decisão: manter a seção crítica SÍNCRONA**, sem `await` entre ler e escrever. Fica atômica por construção — melhor que travar com lock.
+- **Verificação feita no código da biblioteca antes de decidir:** `partitionsConsumedConcurrently` tem padrão **1** e o runner faz `await this.eachMessage(...)` antes de buscar a próxima mensagem (`node_modules/kafkajs/src/consumer/index.js:194` e `runner.js:231`). Ou seja, a kafkajs já serializa por padrão — mas não dependemos disso: a atomicidade vem de a operação ser síncrona.
+- Alternativa descartada: colocar um mutex "para mostrar que sabemos" — indefensável na arguição, já que não protegeria nada.
+- **Aviso registrado:** se a Etapa 7 inserir gravação em banco dentro dessa seção, a janela de corrida se abre e passará a ser necessária serialização explícita.
+
+### 06/09 — A escolha da chave da Etapa 2 resolveu a concorrência de graça
+- Observação de arquitetura: como a chave da mensagem é o `ipOrigem`, **todos os alertas de um mesmo atacante caem sempre na mesma partição e são entregues sempre ao mesmo worker**.
+- Consequência: a contagem local da janela deslizante está **correta sem nenhuma coordenação entre processos**. Se as mensagens fossem distribuídas em rodízio, nenhum worker teria a contagem completa e seria necessário estado compartilhado.
+- Evidência: no teste com 12 alertas, `198.51.100.9` foi inteiramente para o worker-1 (6 mensagens), `203.0.113.45` para o worker-2 (4) e `192.0.2.77` para o worker-3 (2).
+- Custo honesto do trade-off: a divisão é por **partição**, não por mensagem, então um atacante muito ativo concentra carga num worker só. Trocamos balanceamento perfeito por ordenação garantida — que é o que o tema pede.
+
+### 06/09 — Regra de bloqueio em duas camadas, isolada do worker
+- Decisão: `src/worker/regra-bloqueio.ts` separado do `worker.ts`.
+- Motivo: o tema diz que os workers "validam regras de bloqueio de forma independente". Isolada, a regra fica explicável em 30 segundos na defesa e o `worker.ts` trata de consumo, não de negócio.
+- A regra:
+  1. **Imediata:** `pacotesPorSegundo` acima de 20.000 → é um pico. Abaixo disso é `NORMAL` e **não entra na contagem**.
+  2. **Acumulada:** 3 picos do mesmo `ipOrigem` numa janela de 30 s → `BLOQUEAR` (ataque sustentado). Entre 1 e 2 picos → `SUSPEITO`.
+- Justificativa da composição: *"um pico isolado é suspeito; picos repetidos do mesmo IP caracterizam ataque sustentado."* Só contar quem passou do limiar evita que tráfego normal infle a janela.
+- Evidência de que as camadas compõem: no teste, o worker-2 recebeu um alerta de 19.675 pacotes/s, classificou como `NORMAL` e **não incrementou o contador** — o alerta seguinte apareceu como "2/3", não "3/3".
+- Nota: o worker apenas **recomenda** o bloqueio. Consolidar o lote e emitir o comando único é papel do líder (R5).
+
+### 06/09 — Três workers em três terminais
+- Decisão: `npm run worker -- 1`, `-- 2`, `-- 3`, cada um no seu terminal.
+- Alternativa descartada: script único que sobe os três como processos filhos. Motivos: na Etapa 6 é preciso **matar um worker específico** para demonstrar a redistribuição, o que fica desajeitado com um script só; e os logs separados por worker são exatamente o formato de evidência que o README exige.
+
+### 06/09 — Ruído de log do rebalanceamento: mantido visível
+- Observação: ao subir os workers, a kafkajs registra em nível ERROR mensagens do tipo `The group is rebalancing, so a rejoin is needed`.
+- Diagnóstico: não é erro — é o fluxo normal do protocolo quando a composição do grupo muda. O broker rejeita os heartbeats em curso e os consumidores reentram no grupo. Acontece só na entrada/saída de membros.
+- Decisão: **manter visível**, sem filtro. Além de coerente com a postura de não suprimir erros reais, essas linhas são a evidência de que o rebalanceamento realmente ocorreu — o que é justamente o que o R3 precisa demonstrar.
+- Evidência do rebalanceamento em cadeia, capturada no log do worker-1: `[0, 1, 2]` sozinho → `[0, 1]` quando o worker-2 entrou → `[1]` quando o worker-3 entrou.
