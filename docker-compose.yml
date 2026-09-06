@@ -1,0 +1,58 @@
+# CyberGuardian Node — infraestrutura local (Etapa 1 / R2)
+# Sobe o broker Apache Kafka em modo KRaft (sem Zookeeper).
+# Uso:  docker compose up -d     |     docker compose down
+
+services:
+  kafka:
+    image: apache/kafka:4.0.0
+    container_name: cyberguardian-kafka
+    restart: unless-stopped
+
+    ports:
+      # Publica APENAS a porta externa: e por ela que o Node (no Windows) fala com o Kafka.
+      # A 9092 nao e publicada de proposito — ela so faz sentido dentro da rede do Docker.
+      - "29092:29092"
+
+    environment:
+      # --- Identidade do no no cluster (modo KRaft: o proprio Kafka se coordena) ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+
+      # --- Portas que o broker abre DENTRO do container ---
+      KAFKA_LISTENERS: INTERNO://0.0.0.0:9092,EXTERNO://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNO:PLAINTEXT,EXTERNO:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNO
+
+      # --- PONTO CRITICO: endereco que o broker ANUNCIA a cada cliente ---
+      # Cliente que entrou pela porta interna recebe "kafka:9092" (nome na rede do Docker).
+      # Cliente que entrou pela porta externa recebe "localhost:29092" (endereco valido no Windows).
+      KAFKA_ADVERTISED_LISTENERS: INTERNO://kafka:9092,EXTERNO://localhost:29092
+
+      # --- Cluster de 1 broker: nao existe outro no para onde replicar ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Sem espera artificial para formar o grupo de consumidores (acelera a demonstracao do R3)
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # --- Proibe criacao automatica de topico ---
+      # Se ficasse ligado, um erro de digitacao no nome do topico criaria silenciosamente
+      # um topico novo com 1 particao — e ai so 1 dos 3 workers receberia mensagens (quebra o R3).
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+      # --- Onde o broker grava as mensagens (dentro do container, sem volume) ---
+      # Decisao consciente: fila EFEMERA. "docker compose down" limpa a fila.
+      # Persistencia de broker nao e exigida pelo escopo — o R6 trata de queda de
+      # WORKER (resolvida por ack manual + offsets), nao de queda do broker.
+      # Um volume nomeado aqui quebra por permissao (volume e root; Kafka roda como uid 1000).
+      KAFKA_LOG_DIRS: /tmp/kafka-logs
+
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s

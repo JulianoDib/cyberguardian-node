@@ -6,7 +6,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "teste:produtor": "node --disable-warning=TimeoutNegativeWarning dist/testes/produtor-teste.js",
+    "teste:consumidor": "node --disable-warning=TimeoutNegativeWarning dist/testes/consumidor-teste.js"
   },
   "keywords": [],
   "author": "",
@@ -15,5 +17,8 @@
   "devDependencies": {
     "@types/node": "^26.4.1",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "kafkajs": "^2.2.4"
   }
 }

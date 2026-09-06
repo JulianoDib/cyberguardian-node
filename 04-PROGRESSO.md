@@ -6,8 +6,8 @@
 
 ## Estado atual
 **Fase:** Desenvolvimento iniciado.
-**Etapa atual:** Etapa 0 (Setup) — estrutura do projeto PRONTA; faltam Docker Desktop e GitHub/push.
-**Última atualização:** 05/09/2026 — sessão de trabalho: estrutura Node/TypeScript + git local.
+**Etapa atual:** Etapa 1 (R2/Kafka) CONCLUIDA. Proxima: Etapa 2 (R1 - Gateway TCP).
+**Última atualização:** 06/09/2026 — sessão de trabalho: Kafka rodando, contrato da mensagem definido, produtor/consumidor de teste validados ponta a ponta.
 
 ## Checklist de etapas
 - [x] Análise do enunciado e divisão em etapas
@@ -19,10 +19,17 @@
   - [x] `tsconfig.json` com tipagem rigorosa (src/ → dist/) — compilação verificada
   - [x] `src/index.ts` compila e roda (`npm run build` + `npm start`)
   - [x] `git init` (branch main) + `.gitignore`
-  - [ ] **Docker Desktop instalado** (não está na máquina 1 — bloqueia a Etapa 1)
+  - [x] **Docker Desktop instalado** (Engine 29.7.2 / Compose v5.5.0) — instalado em `AppData\Local\Programs\DockerDesktop`
   - [ ] Repositório no GitHub + primeiro push (combinado de fazer junto com o aluno)
 - [ ] Etapa 0b — Setup de ambiente (máquina 2, quando necessário)
-- [ ] Etapa 1 — R2: Kafka rodando + produtor/consumidor de teste
+- [x] Etapa 1 — R2: Kafka rodando + produtor/consumidor de teste — **CONCLUIDA**
+  - [x] `docker-compose.yml` com Apache Kafka 4.0.0 em modo KRaft (1 servico, sem Zookeeper)
+  - [x] Duplo listener resolvido (INTERNO 9092 / EXTERNO 29092) — Node no Windows conecta em `localhost:29092`
+  - [x] Topico `alertas-anomalia` criado com **3 particoes** (teto de paralelismo do R3)
+  - [x] `kafkajs` 2.2.4 instalada (client puro JS, sem compilacao nativa)
+  - [x] Contrato da mensagem em `src/compartilhado/tipos.ts`, **com campo `lamport` ja presente**
+  - [x] Produtor e consumidor de teste rodando (`npm run teste:produtor` / `teste:consumidor`)
+  - [x] **Mensagem viajou ponta a ponta** — mesmo UUID publicado e recebido
 - [ ] Etapa 2 — R1: Gateway TCP com framing + ACK + simulador de sensor
 - [ ] Etapa 3 — R3: 3 workers em Competing Consumers
 - [ ] Etapa 4 — R4: Relógios de Lamport nos logs de auditoria
@@ -44,7 +51,24 @@
 2. Conferir a etapa atual no checklist e o critério de "pronto" dela no 02-PLANO.md.
 3. Perguntar ao aluno como ele quer conduzir a etapa (manual, misto ou delegado) e seguir.
 
-## Notas da última sessão (05/09 — Etapa 0)
+## Notas da última sessão (06/09 — Etapa 1 concluída)
+- **Prova de que o Kafka funciona:** produtor publicou o envelope `a8643768-d5a1-427f-9f29-bb7d52f682d1`
+  na partição 2; consumidor leu exatamente esse id, offset 2. A armadilha do `advertised.listeners`
+  está vencida — cliente rodando no Windows fala com broker dentro do container.
+- Chave da mensagem = `ipOrigem`: duas execuções caíram na **mesma partição (2)**, confirmando que
+  eventos do mesmo atacante ficam ordenados.
+- `kafka-consumer-groups.sh --describe` mostrou 1 consumidor segurando as 3 partições. Com os 3
+  workers da Etapa 3, elas se dividem — é essa a evidência do Competing Consumers.
+- **Duas correções de rumo** registradas no 03-DECISOES.md: volume do Kafka montado em caminho errado
+  (não persistia nada, em silêncio) e depois quebrando por permissão — volume removido, fila é efêmera
+  por decisão consciente.
+- **Ruídos de log investigados até a raiz** (nenhum é incompatibilidade com Kafka 4.0):
+  `TimeoutNegativeWarning` é bug latente da kafkajs (`requestQueue/index.js:312`), desligado com flag
+  cirúrgica do Node; erro do `GroupCoordinator` é transitório da criação do grupo e foi mantido visível.
+- Comandos da etapa: `docker compose up -d` → `npm run build` → `npm run teste:consumidor` (um terminal)
+  → `npm run teste:produtor` (outro terminal).
+
+## Notas da sessão anterior (05/09 — Etapa 0)
 - Estrutura do projeto criada e **verificada**: `npm run build` gera `dist/` e `npm start` imprime a mensagem de setup.
 - Tipagem rigorosa testada com erros propositais (índice possivelmente `undefined`, `null` em `number`, parâmetro sem tipo) — os três foram barrados pelo compilador.
 - Ajuste necessário: TypeScript 7 não descobriu `@types/node` sozinho; foi preciso declarar `"types": ["node"]` no tsconfig.
