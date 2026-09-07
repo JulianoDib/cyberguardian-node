@@ -6,8 +6,8 @@
 
 ## Estado atual
 **Fase:** Desenvolvimento iniciado.
-**Etapa atual:** Etapa 3 (R3/Workers) CONCLUIDA. Proxima: Etapa 4 (R4 - Relogios de Lamport).
-**Última atualização:** 06/09/2026 — sessão de trabalho: 3 workers em Competing Consumers, ack manual, regra de bloqueio em duas camadas.
+**Etapa atual:** Etapa 4 (R4/Lamport) CONCLUIDA. Proxima: Etapa 5 (R5 - Eleicao Bully).
+**Última atualização:** 06/09/2026 — sessão de trabalho: Relogios de Lamport no gateway e nos 3 workers, log de auditoria e demonstracao do trade-off vs relogio fisico.
 
 ## Checklist de etapas
 - [x] Análise do enunciado e divisão em etapas
@@ -48,7 +48,15 @@
   - [x] `ehEnvelopeAlerta` — validacao do que vem da fila
   - [x] **Evidencia:** 12 alertas divididos 6/4/2 entre os 3 workers, LAG 0 nas 3 particoes
   - [x] **Rebalanceamento em cadeia capturado:** [0,1,2] -> [0,1] -> [1] conforme os workers entravam
-- [ ] Etapa 4 — R4: Relógios de Lamport nos logs de auditoria
+- [x] Etapa 4 — R4: Relógios de Lamport nos logs de auditoria — **CONCLUIDA**
+  - [x] `src/compartilhado/lamport.ts` — as 3 regras, contador privado
+  - [x] `src/compartilhado/auditoria.ts` — console + JSONL numa chamada so
+  - [x] Gateway instrumentado (3 eventos por alerta: RECEBE-SENSOR / PUBLICA-FILA / ENVIA-ACK)
+  - [x] Workers instrumentados (2 por mensagem: RECEBE-FILA / PROCESSA)
+  - [x] Validacao do carimbo na fronteira (NaN/negativo barrado no contrato)
+  - [x] Ordenacao total deterministica por (lamport, processo)
+  - [x] `demonstracoes/ordenar-auditoria.mjs` — as duas ordens + inversoes + cadeias causais
+  - [x] **Evidencia:** logs com a aritmetica escrita, ex. `max(local=0, msg=2)+1 = 3`
 - [ ] Etapa 5 — R5: Eleição Bully + líder único consolidador
 - [ ] Etapa 6 — R6: Falhas sem perda + reeleição automática
 - [ ] Etapa 7 — Persistência primário + réplica
@@ -74,7 +82,22 @@
 2. Conferir a etapa atual no checklist e o critério de "pronto" dela no 02-PLANO.md.
 3. Perguntar ao aluno como ele quer conduzir a etapa (manual, misto ou delegado) e seguir.
 
-## Notas da última sessão (06/09 — Etapa 3 concluída)
+## Notas da última sessão (06/09 — Etapa 4 concluída)
+- **A evidencia do R4 esta pronta:** `grep LAMPORT` nos logs mostra a conta em cada linha.
+  Exemplo de ouro: `[worker-1] LAMPORT L=3 RECEBE-FILA max(local=0, msg=2)+1 = 3` — o relogio
+  pula de 0 para 3, nao para 1, porque aprendeu sobre eventos que o precedem causalmente.
+- **Demonstracao do trade-off funcionou sem encenacao:** 45 eventos numa rodada de 9 alertas,
+  **104 pares invertidos encontrados naturalmente** (ordem fisica e logica discordando), e
+  **9/9 cadeias causais respeitadas pelo Lamport**. Onde ha causalidade ele nunca inverteu;
+  onde nao ha, so o relogio fisico finge saber a resposta.
+- **Registro honesto:** o tempo fisico tambem respeitou as 9/9 cadeias causais — esperado,
+  porque todos os processos rodam na mesma maquina, sem desvio de relogio. A falha exposta e a
+  FALSA PRECISAO ao ordenar concorrentes, nao inversao causal. Nao foi fabricado nada.
+- **Nenhuma mudanca de contrato foi necessaria** — o campo `metadados.lamport` ja existia desde
+  a Etapa 1, justamente para evitar este retrabalho. So a logica que o preenche mudou.
+- Comandos: `npm run gateway` | `npm run worker -- 1/2/3` | `npm run sensor -- 9` | `npm run demo:lamport`
+
+## Notas da sessão anterior (06/09 — Etapa 3 concluída)
 - **Competing Consumers provado:** 12 alertas, cada um processado por exatamente um worker.
   worker-1 = particao 1 (6 msgs), worker-2 = particao 2 (4), worker-3 = particao 0 (2).
 - **Prova pelo lado do Kafka:** `kafka-consumer-groups.sh --describe --group workers-nids` mostrou

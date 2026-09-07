@@ -309,3 +309,68 @@
 - Diagnóstico: não é erro — é o fluxo normal do protocolo quando a composição do grupo muda. O broker rejeita os heartbeats em curso e os consumidores reentram no grupo. Acontece só na entrada/saída de membros.
 - Decisão: **manter visível**, sem filtro. Além de coerente com a postura de não suprimir erros reais, essas linhas são a evidência de que o rebalanceamento realmente ocorreu — o que é justamente o que o R3 precisa demonstrar.
 - Evidência do rebalanceamento em cadeia, capturada no log do worker-1: `[0, 1, 2]` sozinho → `[0, 1]` quando o worker-2 entrou → `[1]` quando o worker-3 entrou.
+
+---
+
+## Etapa 4 — R4: Relógios de Lamport
+
+### 06/09 — Modelagem A: cada ação é um evento separado
+- Decisão: receber, processar e enviar são eventos distintos, cada um incrementando o contador. Consistente do início ao fim do sistema.
+- Alternativa descartada: contar apenas o par envio/recepção (modelo mínimo). Descartada porque o escopo pede evidência de "atualização dos carimbos" nos logs, e a modelagem granular torna essa evidência mais rica e mais fácil de auditar.
+
+### 06/09 — Quem tem relógio: gateway e workers; o Kafka não participa
+- Decisão: um `RelogioLamport` por processo — o gateway tem um, cada worker tem o seu. O sensor **não** tem relógio. O Kafka apenas transporta.
+- Consequência: quando o gateway recebe um alerta do sensor, não há `L_msg` para compor — é `eventoInterno()`, equivalente a `max(L, 0) + 1`.
+- Justificativa: o relógio pertence ao processo que participa da cadeia causal do sistema distribuído. O sensor é cliente externo; o broker é infraestrutura de transporte.
+- Detalhe de implementação: o relógio do gateway é **um por processo**, não um por conexão. Todos os eventos do gateway compartilham a mesma linha do tempo lógica.
+
+### 06/09 — O carimbo viaja no envelope, não em headers do Kafka
+- Decisão: usar `metadados.lamport`, campo que já existia desde a Etapa 1.
+- Justificativa: o carimbo é metadado **causal** e pertence junto de `correlacaoId` e `causaId`. Mantém a mensagem auto-contida — quem lê a mensagem tem toda a informação causal sem depender de metadados do transporte.
+- Alternativa descartada: headers do Kafka — acoplaria a informação causal ao broker e a perderia se a mensagem fosse repassada por outro meio.
+- Benefício colateral da antecipação feita na Etapa 1: **nenhuma mudança de contrato foi necessária**. Só a lógica que preenche o campo mudou.
+
+### 06/09 — Eventos que incrementam, por processo
+- **Gateway (3 por alerta):** `RECEBE-SENSOR` (interno) → `PUBLICA-FILA` (envio, é o carimbo que viaja) → `ENVIA-ACK` (envio).
+- **Worker (2 por mensagem):** `RECEBE-FILA` (`max(L_local, L_msg) + 1`) → `PROCESSA` (interno).
+- **O ACK ao sensor incrementa**, decidido pela consistência da Modelagem A. Contra-argumento considerado: o destinatário não tem relógio, então o carimbo não é consumido por ninguém. A favor (venceu): o contador também ordena os eventos locais do gateway, onde o ACK existe de fato.
+- **O `commitOffsets` NÃO incrementa.** É escrituração de infraestrutura do Kafka, não evento de domínio. Se contasse, o relógio passaria a medir mecânica de biblioteca em vez de causalidade.
+- **Quadros inválidos e respostas de erro NÃO incrementam.** Mesmo critério: lixo de protocolo não é um alerta recebido.
+- Efeito visível: como o gateway avança de 3 em 3, os carimbos das mensagens publicadas saem 2, 5, 8, 11... — fica óbvio nos logs que houve eventos entre uma publicação e outra.
+
+### 06/09 — Validação do carimbo na FRONTEIRA, não no relógio
+- Contexto: `NaN` passa por `typeof x === "number"`, e `Math.max(qualquer, NaN)` é `NaN` — um carimbo NaN contaminaria o contador do worker **permanentemente**.
+- Decisão: `ehEnvelopeAlerta` passou a exigir `Number.isInteger(lamport) && lamport >= 0`. Assim um carimbo inválido vira **erro permanente** (mensagem descartada e offset confirmado), sem travar a partição.
+- Segunda linha de defesa: `RelogioLamport.aoReceber` também valida e lança `ErroDeRelogio`; o worker trata essa exceção como erro permanente. Nunca deveria disparar — existe para o relógio jamais ser contaminado.
+
+### 06/09 — Ordenação determinística por `(lamport, processo)`
+- Contexto: o escopo pede ordenação **determinística**, e Lamport sozinho dá apenas ordem **parcial** — eventos concorrentes podem ter carimbos iguais.
+- Decisão: ordem total por `(lamport, nome do processo)`, com desempate lexicográfico. É a técnica clássica de totalização.
+- Impacto: rodar a ferramenta de ordenação duas vezes produz sempre o mesmo resultado.
+
+### 06/09 — Log de auditoria: um arquivo por processo, em JSONL
+- Decisão: `logs/auditoria-<processo>.jsonl`, uma linha JSON por evento, truncado no início de cada execução.
+- Arquivos separados (e não um compartilhado) por dois motivos: escrita concorrente de vários processos no mesmo arquivo pode intercalar e corromper linhas no Windows; e separados reproduzem exatamente o cenário que Lamport endereça — registros locais independentes reconciliados depois.
+- `logs/` já estava no `.gitignore` desde a Etapa 0.
+- **Uma única chamada (`RegistradorAuditoria.registrar`) escreve o console E o arquivo.** Se fossem chamadas separadas, os dois poderiam divergir e a demonstração perderia valor de prova.
+- Escrita **síncrona**, logo após o incremento, sem `await` no meio: o registro nunca sai de ordem em relação ao contador. Custo honesto: é I/O bloqueante — aceitável neste volume, seria bufferizado em produção.
+- Nota: isto é log de auditoria em arquivo, **não** a persistência primário+réplica da Etapa 7.
+
+### 06/09 — Formato do log com a aritmética explícita
+- Decisão: toda linha de relógio leva o marcador `LAMPORT` e **escreve a conta**: `max(local=4, msg=20)+1 = 21`.
+- Justificativa: o README exige evidência da atualização dos carimbos. Escrever a conta permite ao avaliador **conferir a regra na própria linha**, em vez de acreditar na afirmação. `grep LAMPORT` extrai a evidência pronta.
+- Evidência colhida: `[worker-1] LAMPORT L=3 RECEBE-FILA max(local=0, msg=2)+1 = 3` — o relógio pula de 0 para **3**, não para 1, porque aprendeu sobre eventos que o precedem causalmente. Nenhum relógio físico transporta essa informação.
+
+### 06/09 — Demonstração "Lamport vs Relógio Físico": o que é e o que NÃO é demonstrável
+- **Não é demonstrável nesta montagem:** relógio físico atrasado invertendo uma relação causal real. Isso exige desvio de relógio entre máquinas, e todos os processos rodam na mesma máquina com o mesmo relógio de parede. Aqui o relógio físico está no **melhor cenário possível**. Fingir o contrário seria desonesto.
+- **É demonstrável, e basta:** que mesmo com relógios físicos perfeitamente sincronizados, a ordem física e a ordem lógica **discordam** — e que a ordem física é a que carece de significado.
+- Resultado medido (execução de 06/09, 45 eventos): **104 pares invertidos encontrados naturalmente**, sem nenhuma encenação. Exemplo: `gateway L=4 às 13:50:23.952` e `worker-1 L=3 às 13:50:23.956` — fisicamente o gateway veio antes, logicamente o worker-1 veio antes.
+- **O contraponto que fecha o argumento:** as **9/9 cadeias causais** (gateway publica → worker recebe) foram respeitadas pelo Lamport. Ou seja, onde existe causalidade ele nunca inverteu; onde não existe, as duas réguas discordam — e só a física finge saber a resposta.
+- Registro honesto: o tempo físico também respeitou as 9/9 cadeias causais nesta execução. Esperado — sem desvio de relógio, ele não tem como errar nesse quesito. A falha que a demonstração expõe é a **falsa precisão** ao ordenar eventos concorrentes, não inversão causal.
+- Ferramenta: `demonstracoes/ordenar-auditoria.mjs` (`npm run demo:lamport`). Mescla os logs, imprime as duas ordens, encontra os pares invertidos automaticamente e verifica as cadeias causais.
+
+### 06/09 — Observação: nesta topologia o `max` sempre escolhe o carimbo da mensagem
+- Fato observado nos logs: em todas as recepções, `L_msg > L_local` — o `max` sempre pegou o valor da mensagem.
+- Explicação: o gateway é ancestral causal de tudo e avança 3 por alerta, enquanto os workers avançam 2 por mensagem. O gateway está sempre à frente.
+- Consequência honesta: o `max` está funcionando (os saltos de 0→3, 4→21, 10→18 provam isso), mas um caso em que o relógio **local** domina não aparece nesta topologia. Ele exigiria um processo com mais eventos locais que o carimbo recebido.
+- Não foi forçado artificialmente. Registrado para não afirmar mais do que os dados mostram.

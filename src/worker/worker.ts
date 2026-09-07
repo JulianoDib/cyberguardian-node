@@ -1,11 +1,21 @@
 /**
- * WORKER — consumidor independente da fila de alertas (R3).
+ * WORKER — consumidor independente da fila de alertas (R3) + relogio de
+ * Lamport (R4).
  *
  * Sobem 3 processos identicos, diferindo apenas pelo numero de identificacao.
  * Todos declaram o MESMO groupId, entao o Kafka reparte as 3 particoes entre
  * eles: cada mensagem e processada por exatamente um worker (Competing
- * Consumers). Os workers nao conversam entre si e nao sabem que os outros
- * existem.
+ * Consumers). Os workers nao conversam entre si.
+ *
+ * RELOGIO DE LAMPORT (R4): cada worker tem o SEU relogio, independente dos
+ * demais. Dois eventos por mensagem:
+ *
+ *   1. RECEBE-FILA : L = max(L_local, L_mensagem) + 1   <- a regra 3
+ *   2. PROCESSA    : L = L + 1                          <- evento interno
+ *
+ * NAO incrementa: `commitOffsets`. E escrituracao de infraestrutura do Kafka,
+ * nao evento de dominio — se contasse, o relogio passaria a medir mecanica de
+ * biblioteca em vez de causalidade.
  *
  * Uso:  npm run build && npm run worker -- 1
  *       (em outros terminais: npm run worker -- 2 / npm run worker -- 3)
@@ -13,7 +23,9 @@
 
 import type { Consumer } from "kafkajs";
 
+import { RegistradorAuditoria } from "../compartilhado/auditoria";
 import { criarKafka, TOPICO_ALERTAS } from "../compartilhado/kafka";
+import { ErroDeRelogio, RelogioLamport } from "../compartilhado/lamport";
 import { ehEnvelopeAlerta } from "../compartilhado/tipos";
 import { AvaliadorDeBloqueio } from "./regra-bloqueio";
 
@@ -70,26 +82,28 @@ async function principal(): Promise<void> {
    *
    * Com a confirmacao automatica (o padrao), a biblioteca salva o offset de
    * tempos em tempos, em segundo plano, SEM saber se o processamento terminou.
-   * Se o worker morresse logo depois de um commit automatico e antes de
-   * terminar o processamento, o Kafka consideraria a mensagem lida e NUNCA
-   * mais a entregaria: perda silenciosa.
+   * Se o worker morresse nessa janela, o Kafka consideraria a mensagem lida e
+   * NUNCA mais a entregaria: perda silenciosa.
    */
   const consumidor: Consumer = kafka.consumer({ groupId: GRUPO_WORKERS });
 
-  /** Estado local deste worker (ver comentario da secao critica na regra). */
+  /** Estado local deste worker (ver a secao critica em regra-bloqueio.ts). */
   const avaliador = new AvaliadorDeBloqueio();
+
+  /** Relogio logico DESTE worker. Comeca em 0, independente dos outros. */
+  const relogio = new RelogioLamport();
+  const auditoria = new RegistradorAuditoria(nome);
 
   let processadas = 0;
   let bloqueios = 0;
 
-  // Evidencia do Competing Consumers (R3): mostra quais particoes o Kafka
-  // atribuiu a ESTE worker. Subindo os 3, as particoes 0, 1 e 2 se dividem.
+  // Evidencia do Competing Consumers (R3): quais particoes o Kafka atribuiu a
+  // ESTE worker. Subindo os 3, as particoes 0, 1 e 2 se dividem.
   consumidor.on(consumidor.events.GROUP_JOIN, (evento) => {
     const atribuidas: number[] = evento.payload.memberAssignment[TOPICO_ALERTAS] ?? [];
     log(`>>> GRUPO "${GRUPO_WORKERS}" | particoes atribuidas: [${atribuidas.join(", ")}]`);
   });
 
-  // Quando um worker cai ou entra, o Kafka redistribui as particoes.
   consumidor.on(consumidor.events.REBALANCING, () => {
     log(">>> rebalanceamento em andamento (algum worker entrou ou saiu do grupo)");
   });
@@ -97,6 +111,7 @@ async function principal(): Promise<void> {
   log("conectando ao Kafka...");
   await consumidor.connect();
   await consumidor.subscribe({ topic: TOPICO_ALERTAS, fromBeginning: true });
+  log(`auditoria em ${auditoria.arquivo} | relogio de Lamport iniciado em L=${relogio.valor}`);
   log(`inscrito em "${TOPICO_ALERTAS}" | aguardando atribuicao de particoes...`);
 
   await consumidor.run({
@@ -135,20 +150,63 @@ async function principal(): Promise<void> {
       }
 
       // ---------------------------------------------------------------
-      // PROCESSAMENTO
+      // LAMPORT, evento 1 — RECEPCAO (regra 3):
+      //
+      //     L = max(L_local, L_mensagem) + 1
+      //
+      // O `max` faz o relogio SALTAR se a mensagem vier de um processo que ja
+      // viu mais eventos — e assim que a informacao causal se propaga. O `+1`
+      // garante a desigualdade estrita em relacao ao envio.
+      //
+      // Guardamos o valor anterior ANTES de chamar, para o log poder exibir a
+      // conta inteira e o avaliador conseguir conferir a regra na linha.
+      // ---------------------------------------------------------------
+      const lamportLocalAntes = relogio.valor;
+      const lamportDaMensagem = valor.metadados.lamport;
+
+      let lamportRecebe: number;
+      try {
+        lamportRecebe = relogio.aoReceber(lamportDaMensagem);
+      } catch (erro: unknown) {
+        // Carimbo invalido e problema PERMANENTE do dado: nao adianta reentregar.
+        // (O validador de envelope ja deveria ter barrado; isto e a segunda
+        // linha de defesa, para o relogio nunca ser contaminado.)
+        const detalhe: string = erro instanceof ErroDeRelogio ? erro.message : String(erro);
+        log(`${posicao} | DESCARTADA: ${detalhe}`);
+        await confirmarOffset(consumidor, topic, partition, message.offset);
+        return;
+      }
+
+      auditoria.registrar({
+        lamport: lamportRecebe,
+        tipo: "RECEBE-FILA",
+        calculo: `max(local=${lamportLocalAntes}, msg=${lamportDaMensagem})+1 = ${lamportRecebe}`,
+        detalhe: `${posicao} de ${valor.metadados.origemId}`,
+        mensagemId: valor.id,
+      });
+
+      // ---------------------------------------------------------------
+      // LAMPORT, evento 2 — PROCESSAMENTO (evento interno)
       // ---------------------------------------------------------------
       try {
+        const lamportAntesDoProcessa = relogio.valor;
         const decisao = avaliador.avaliar(valor.payload, Date.now());
+        const lamportProcessa = relogio.eventoInterno();
+
         processadas++;
         if (decisao.severidade === "BLOQUEAR") {
           bloqueios++;
         }
 
-        log(
-          `${posicao} | ${valor.payload.ipOrigem} -> ${valor.payload.ipDestino} | ` +
-            `${valor.payload.pacotesPorSegundo} pac/s | lamport=${valor.metadados.lamport} | ` +
-            `${decisao.severidade} | ${decisao.motivo}`
-        );
+        auditoria.registrar({
+          lamport: lamportProcessa,
+          tipo: "PROCESSA",
+          calculo: `interno: ${lamportAntesDoProcessa}+1 = ${lamportProcessa}`,
+          detalhe:
+            `${valor.payload.ipOrigem} ${valor.payload.pacotesPorSegundo} pac/s ` +
+            `| ${decisao.severidade} | ${decisao.motivo}`,
+          mensagemId: valor.id,
+        });
 
         if (decisao.severidade === "BLOQUEAR") {
           // Por enquanto o worker apenas REGISTRA a recomendacao. Consolidar o
@@ -166,6 +224,7 @@ async function principal(): Promise<void> {
 
       // ---------------------------------------------------------------
       // So agora o ACK: o offset avanca DEPOIS do processamento concluido.
+      // Nao e evento de Lamport (ver cabecalho do arquivo).
       // ---------------------------------------------------------------
       await confirmarOffset(consumidor, topic, partition, message.offset);
       log(`${posicao} | offset confirmado -> ${BigInt(message.offset) + 1n}`);
@@ -175,7 +234,7 @@ async function principal(): Promise<void> {
   const encerrar = async (): Promise<void> => {
     log(
       `encerrando... processadas=${processadas} bloqueios=${bloqueios} ` +
-        `ips monitorados=${avaliador.ipsMonitorados}`
+        `ips monitorados=${avaliador.ipsMonitorados} | relogio final: L=${relogio.valor}`
     );
     // Sair do grupo avisando o broker faz o Kafka redistribuir as particoes
     // imediatamente, em vez de esperar o tempo de expiracao da sessao.

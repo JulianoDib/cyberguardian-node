@@ -13,7 +13,8 @@
     "demo:solucao": "node demonstracoes/solucao-com-framing.mjs",
     "gateway": "node --disable-warning=TimeoutNegativeWarning dist/gateway/servidor.js",
     "sensor": "node --disable-warning=TimeoutNegativeWarning dist/sensor/simulador.js",
-    "worker": "node --disable-warning=TimeoutNegativeWarning dist/worker/worker.js"
+    "worker": "node --disable-warning=TimeoutNegativeWarning dist/worker/worker.js",
+    "demo:lamport": "node demonstracoes/ordenar-auditoria.mjs"
   },
   "keywords": [],
   "author": "",

@@ -1,17 +1,24 @@
 /**
- * PONTO DE ENTRADA (Gateway) — R1.
+ * PONTO DE ENTRADA (Gateway) — R1 + relogio de Lamport (R4).
  *
  * Servidor TCP puro que recebe alertas dos sensores, publica cada um na fila
  * do Kafka e devolve um ACK DE ENFILEIRAMENTO ao sensor.
- *
- * Fluxo de uma mensagem:
  *
  *   sensor --[quadro TCP]--> gateway --[envelope]--> Kafka
  *   sensor <--[quadro ACK]-- gateway <--[confirmacao]--
  *
  * Desacoplamento (R1/R2): o gateway NAO processa o alerta e nao conhece os
- * workers. A responsabilidade dele termina no enfileiramento — quem analisa e
- * decide bloqueio sao os workers, depois, de forma independente.
+ * workers. A responsabilidade dele termina no enfileiramento.
+ *
+ * RELOGIO DE LAMPORT (R4): o gateway tem UM relogio, do processo inteiro (nao
+ * um por conexao). Tres eventos por alerta:
+ *
+ *   1. RECEBE-SENSOR : evento interno (o sensor nao tem relogio proprio)
+ *   2. PUBLICA-FILA  : envio — este e o carimbo que viaja em metadados.lamport
+ *   3. ENVIA-ACK     : envio
+ *
+ * NAO incrementam: quadros invalidos e respostas de erro. O contador mede
+ * eventos de DOMINIO; lixo de protocolo nao e um alerta recebido.
  *
  * Uso:  npm run build && npm run gateway
  */
@@ -20,35 +27,43 @@ import net from "node:net";
 import { randomUUID } from "node:crypto";
 import type { Producer } from "kafkajs";
 
+import { RegistradorAuditoria } from "../compartilhado/auditoria";
 import { codificarQuadro, DecodificadorDeQuadros, ErroDeFraming } from "../compartilhado/framing";
 import { criarKafka, criarProdutor, TOPICO_ALERTAS } from "../compartilhado/kafka";
+import { RelogioLamport } from "../compartilhado/lamport";
 import { HOST_GATEWAY, PORTA_GATEWAY, TIMEOUT_OCIOSIDADE_MS } from "../compartilhado/rede";
 import { ehAlertaAnomalia } from "../compartilhado/tipos";
 import type { AlertaAnomalia, EnvelopeAlerta, RespostaGateway } from "../compartilhado/tipos";
 
-/** Identificacao deste processo nos metadados e no Kafka. */
+/** Identificacao deste processo nos metadados, no Kafka e na auditoria. */
 const ORIGEM = "gateway";
 
+/** Tudo que o tratamento de uma conexao precisa. */
+interface ContextoGateway {
+  readonly produtor: Producer;
+  readonly relogio: RelogioLamport;
+  readonly auditoria: RegistradorAuditoria;
+}
+
 function log(mensagem: string): void {
-  console.log(`[gateway] ${mensagem}`);
+  console.log(`[${ORIGEM}] ${mensagem}`);
 }
 
 /**
  * Embrulha o alerta cru do sensor no envelope que trafega na fila.
  *
- * O sensor manda apenas o ALERTA; e o gateway que gera o identificador unico e
- * os metadados causais. Na Etapa 4 e aqui que o carimbo de Lamport passa a ser
- * calculado — por isso ele ja circula com valor 0.
+ * O sensor manda apenas o ALERTA; e o gateway que gera o identificador unico,
+ * os metadados causais e o CARIMBO DE LAMPORT.
  */
-function montarEnvelope(alerta: AlertaAnomalia): EnvelopeAlerta {
+function montarEnvelope(alerta: AlertaAnomalia, carimboLamport: number): EnvelopeAlerta {
   return {
     id: randomUUID(),
     payload: alerta,
     metadados: {
-      // Quem colocou a mensagem na fila foi o gateway; o sensor de origem
-      // continua identificado dentro do payload, em `sensorId`.
       origemId: ORIGEM,
-      lamport: 0,
+      // Carimbo LOGICO: o valor ja incrementado pela regra de envio.
+      lamport: carimboLamport,
+      // Carimbo FISICO, para o contraste na demonstracao.
       emitidoEm: new Date().toISOString(),
       correlacaoId: randomUUID(),
       causaId: null,
@@ -67,15 +82,16 @@ function responder(socket: net.Socket, resposta: RespostaGateway): void {
 /**
  * Processa UM quadro completo: valida, publica no Kafka e responde.
  *
- * Nunca lanca: toda falha vira uma resposta de erro ao sensor. Isso mantem a
- * fila de processamento da conexao viva mesmo diante de um sensor com defeito.
+ * Nunca lanca: toda falha vira uma resposta de erro ao sensor.
  */
 async function processarQuadro(
   socket: net.Socket,
-  produtor: Producer,
+  contexto: ContextoGateway,
   quadro: string,
   cliente: string
 ): Promise<void> {
+  const { produtor, relogio, auditoria } = contexto;
+
   // --- 1) O conteudo veio da rede: nao se confia nele ---
   let valor: unknown;
   try {
@@ -92,16 +108,31 @@ async function processarQuadro(
     return;
   }
 
-  // --- 2) Enfileira ---
-  const envelope: EnvelopeAlerta = montarEnvelope(valor);
+  // --- 2) LAMPORT, evento 1: recepcao do alerta ---
+  // Evento INTERNO porque o sensor nao tem relogio: nao ha L_msg para compor.
+  const antesDoRecebe = relogio.valor;
+  const lamportRecebe = relogio.eventoInterno();
+  auditoria.registrar({
+    lamport: lamportRecebe,
+    tipo: "RECEBE-SENSOR",
+    calculo: `interno: ${antesDoRecebe}+1 = ${lamportRecebe}`,
+    detalhe: `${valor.sensorId} ${valor.ipOrigem} -> ${valor.ipDestino}`,
+    mensagemId: null,
+  });
+
+  // --- 3) LAMPORT, evento 2: envio para a fila ---
+  // O carimbo e o valor POSTERIOR ao incremento; e ele que viaja na mensagem.
+  const antesDoEnvio = relogio.valor;
+  const carimbo = relogio.aoEnviar();
+  const envelope: EnvelopeAlerta = montarEnvelope(valor, carimbo);
 
   try {
     const resultado = await produtor.send({
       topic: TOPICO_ALERTAS,
       messages: [
         {
-          // Chave = IP atacante: mantem todos os alertas do mesmo ataque na
-          // mesma particao e, portanto, em ordem.
+          // Chave = IP atacante: mantem os alertas do mesmo ataque na mesma
+          // particao e, portanto, em ordem.
           key: envelope.payload.ipOrigem,
           value: JSON.stringify(envelope),
         },
@@ -112,14 +143,28 @@ async function processarQuadro(
     const particao: number = destino?.partition ?? -1;
     const offset: string = destino?.baseOffset ?? destino?.offset ?? "?";
 
-    log(
-      `enfileirado ${envelope.id} | ${envelope.payload.ipOrigem} -> ` +
-        `${envelope.payload.ipDestino} | ${envelope.payload.pacotesPorSegundo} pacotes/s ` +
-        `| particao ${particao} offset ${offset}`
-    );
+    auditoria.registrar({
+      lamport: carimbo,
+      tipo: "PUBLICA-FILA",
+      calculo: `envio: ${antesDoEnvio}+1 = ${carimbo}  [carimbo=${carimbo}]`,
+      detalhe: `p${particao} off=${offset} ${envelope.payload.pacotesPorSegundo} pac/s`,
+      mensagemId: envelope.id,
+    });
 
-    // --- 3) So agora o ACK: ele afirma "esta na fila", e o Kafka ja confirmou ---
+    // --- 4) LAMPORT, evento 3: envio do ACK ---
+    const antesDoAck = relogio.valor;
+    const lamportAck = relogio.aoEnviar();
+
+    // So agora o ACK: ele afirma "esta na fila", e o Kafka ja confirmou.
     responder(socket, { tipo: "ACK", id: envelope.id, particao, offset });
+
+    auditoria.registrar({
+      lamport: lamportAck,
+      tipo: "ENVIA-ACK",
+      calculo: `envio: ${antesDoAck}+1 = ${lamportAck}`,
+      detalhe: `para ${cliente}`,
+      mensagemId: envelope.id,
+    });
   } catch (erro: unknown) {
     const detalhe: string = erro instanceof Error ? erro.message : String(erro);
     log(`FALHA ao enfileirar alerta de ${cliente}: ${detalhe}`);
@@ -129,7 +174,7 @@ async function processarQuadro(
 }
 
 /** Trata uma conexao de sensor do inicio ao fim. */
-function atenderConexao(socket: net.Socket, produtor: Producer): void {
+function atenderConexao(socket: net.Socket, contexto: ContextoGateway): void {
   const cliente = `${socket.remoteAddress ?? "?"}:${socket.remotePort ?? "?"}`;
 
   // Um decodificador POR CONEXAO: os bytes pela metade de um sensor nao podem
@@ -141,12 +186,11 @@ function atenderConexao(socket: net.Socket, produtor: Producer): void {
    *
    * O tratamento de cada quadro e assincrono (espera o Kafka). Sem esta fila,
    * dois quadros chegando em sequencia teriam suas publicacoes disparadas em
-   * paralelo e poderiam ser gravados FORA DE ORDEM na particao, destruindo a
-   * ordenacao por atacante que a chave da mensagem garante.
+   * paralelo e poderiam ser gravados FORA DE ORDEM na particao.
    *
-   * Encadear promessas serializa o processamento DENTRO da conexao, sem
-   * bloquear as demais: conexoes diferentes seguem sendo atendidas em paralelo
-   * pelo event loop.
+   * Com o relogio de Lamport, a fila passou a proteger tambem o CONTADOR: sem
+   * ela, dois quadros poderiam intercalar seus incrementos e os carimbos das
+   * mensagens sairiam fora da ordem em que os alertas realmente chegaram.
    */
   let fila: Promise<void> = Promise.resolve();
 
@@ -159,8 +203,8 @@ function atenderConexao(socket: net.Socket, produtor: Producer): void {
     try {
       quadros = decodificador.receber(pedaco);
     } catch (erro: unknown) {
-      // Violacao de protocolo (ex.: cabecalho anunciando quadro gigante).
-      // Nao da para reencontrar o alinhamento do fluxo: derruba a conexao.
+      // Violacao de protocolo: perdido o alinhamento do fluxo, nao ha como
+      // reencontra-lo. Derruba a conexao.
       const motivo: string =
         erro instanceof ErroDeFraming ? erro.message : "falha ao decodificar quadro";
       log(`protocolo violado por ${cliente}: ${motivo} — encerrando conexao`);
@@ -171,9 +215,8 @@ function atenderConexao(socket: net.Socket, produtor: Producer): void {
 
     for (const quadro of quadros) {
       fila = fila
-        .then(() => processarQuadro(socket, produtor, quadro, cliente))
+        .then(() => processarQuadro(socket, contexto, quadro, cliente))
         .catch((erro: unknown) => {
-          // Rede de seguranca: mantem a fila viva mesmo diante do inesperado.
           log(`falha inesperada ao processar quadro de ${cliente}: ${String(erro)}`);
         });
     }
@@ -185,7 +228,6 @@ function atenderConexao(socket: net.Socket, produtor: Producer): void {
   });
 
   socket.on("error", (erro: Error) => {
-    // Ex.: o sensor sumiu no meio de uma escrita. Nao pode derrubar o gateway.
     log(`erro de socket com ${cliente}: ${erro.message}`);
   });
 
@@ -198,12 +240,20 @@ async function principal(): Promise<void> {
   const kafka = criarKafka(ORIGEM);
   const produtor = criarProdutor(kafka);
 
+  // UM relogio para o processo inteiro. Nao um por conexao: o relogio pertence
+  // ao PROCESSO, e todos os eventos dele compartilham a mesma linha do tempo.
+  const relogio = new RelogioLamport();
+  const auditoria = new RegistradorAuditoria(ORIGEM);
+
+  const contexto: ContextoGateway = { produtor, relogio, auditoria };
+
   log("conectando ao Kafka...");
   await produtor.connect();
   log("conectado ao Kafka.");
+  log(`auditoria em ${auditoria.arquivo} | relogio de Lamport iniciado em L=${relogio.valor}`);
 
   const servidor = net.createServer((socket: net.Socket) => {
-    atenderConexao(socket, produtor);
+    atenderConexao(socket, contexto);
   });
 
   servidor.on("error", (erro: Error) => {
@@ -219,10 +269,8 @@ async function principal(): Promise<void> {
 
   log(`Ponto de Entrada ouvindo em ${HOST_GATEWAY}:${PORTA_GATEWAY} (Ctrl+C para sair)`);
 
-  // Encerramento gracioso: para de aceitar conexoes e fecha o produtor,
-  // garantindo que nada fique pendente de envio.
   const encerrar = async (): Promise<void> => {
-    log("encerrando...");
+    log(`encerrando... relogio final: L=${relogio.valor}`);
     servidor.close();
     await produtor.disconnect();
     log("desconectado. Fim.");

@@ -202,9 +202,19 @@ export function ehEnvelopeAlerta(valor: unknown): valor is EnvelopeAlerta {
 
   const meta = metadados as Record<string, unknown>;
 
+  // Extraido para variavel para o TypeScript conseguir estreitar o tipo nas
+  // condicoes seguintes. A checagem de inteiro >= 0 acontece AQUI, na fronteira,
+  // e nao dentro do relogio: `NaN` passa por `typeof x === "number"` e um
+  // carimbo NaN contaminaria o contador do worker para sempre, porque
+  // `Math.max(qualquer, NaN)` e NaN. Barrado aqui, vira erro PERMANENTE — a
+  // mensagem e descartada e confirmada, sem travar a particao.
+  const lamport: unknown = meta["lamport"];
+
   return (
     typeof meta["origemId"] === "string" &&
-    typeof meta["lamport"] === "number" &&
+    typeof lamport === "number" &&
+    Number.isInteger(lamport) &&
+    lamport >= 0 &&
     typeof meta["emitidoEm"] === "string" &&
     typeof meta["correlacaoId"] === "string" &&
     (meta["causaId"] === null || typeof meta["causaId"] === "string")
