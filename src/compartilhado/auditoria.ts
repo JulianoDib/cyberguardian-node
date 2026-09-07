@@ -24,11 +24,25 @@ const PASTA_LOGS = "logs";
 
 /** Os eventos que fazem o relogio avancar, em todo o sistema. */
 export type TipoEvento =
+  // --- fluxo dos alertas (R1/R3) ---
   | "RECEBE-SENSOR"
   | "PUBLICA-FILA"
   | "ENVIA-ACK"
   | "RECEBE-FILA"
-  | "PROCESSA";
+  | "PROCESSA"
+  // --- coordenacao / eleicao de lider (R5) ---
+  // HEARTBEAT nao aparece aqui de proposito: e sondagem de infraestrutura,
+  // nao evento de dominio, e nao incrementa o relogio.
+  | "ELECTION-ENVIA"
+  | "ELECTION-RECEBE"
+  | "OK-ENVIA"
+  | "OK-RECEBE"
+  | "COORDINATOR-ENVIA"
+  | "COORDINATOR-RECEBE"
+  // --- consolidacao do lote pelo lider (R5) ---
+  | "RECOMENDACAO-ENVIA"
+  | "RECOMENDACAO-RECEBE"
+  | "CONSOLIDA";
 
 /** Uma linha do log de auditoria. */
 export interface RegistroAuditoria {
@@ -99,7 +113,7 @@ export class RegistradorAuditoria {
     console.log(
       `[${this.processo}] LAMPORT ` +
         `${`L=${registro.lamport}`.padEnd(7)}` +
-        `${registro.tipo.padEnd(14)}` +
+        `${registro.tipo.padEnd(20)}` +
         `${registro.calculo.padEnd(30)}` +
         `${registro.detalhe}`
     );

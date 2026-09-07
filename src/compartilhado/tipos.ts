@@ -220,3 +220,79 @@ export function ehEnvelopeAlerta(valor: unknown): valor is EnvelopeAlerta {
     (meta["causaId"] === null || typeof meta["causaId"] === "string")
   );
 }
+
+// ---------------------------------------------------------------------------
+// CONSOLIDACAO DO LOTE (R5) — o lider e o unico que consolida e bloqueia
+// ---------------------------------------------------------------------------
+
+/**
+ * Recomendacao de bloqueio emitida por UM worker ao detectar ataque sustentado.
+ *
+ * O worker apenas RECOMENDA: quem decide e emite o comando ao firewall e o
+ * lider. Um worker que emitisse comando por conta propria produziria comandos
+ * duplicados — exatamente o que o tema proibe.
+ */
+export interface RecomendacaoBloqueio {
+  /** Id do envelope que motivou a recomendacao (rastreabilidade). */
+  readonly alertaId: string;
+  /** O IP atacante que se recomenda bloquear. */
+  readonly ipOrigem: string;
+  readonly sensorId: string;
+  readonly pacotesPorSegundo: number;
+  /** Qual worker detectou. */
+  readonly detectadoPor: number;
+  /** Carimbo de Lamport do worker no momento da deteccao. */
+  readonly lamportDeteccao: number;
+}
+
+/**
+ * ENTIDADE 3 — RegistroBloqueio.
+ *
+ * Fecha a modelagem minima exigida pelo escopo:
+ *
+ *     SensorRede  ->  AlertaAnomalia  ->  RegistroBloqueio
+ *
+ * Produzido APENAS pelo lider, ao fechar um lote. Um registro por IP bloqueado,
+ * mesmo que varios alertas de varios workers tenham motivado o bloqueio — e a
+ * deduplicacao que garante "sem comandos duplicados".
+ */
+export interface RegistroBloqueio {
+  readonly id: string;
+  /** Numero sequencial do lote em que este bloqueio foi consolidado. */
+  readonly loteId: number;
+  readonly ipBloqueado: string;
+  /** Id do worker lider que emitiu — o unico autorizado a fazer isso. */
+  readonly emitidoPor: number;
+  /** Carimbo LOGICO do lider ao consolidar o lote. */
+  readonly lamport: number;
+  /** Ids dos alertas que motivaram o bloqueio (historico causal). */
+  readonly alertasQueMotivaram: readonly string[];
+  readonly quantidadeAlertas: number;
+  /** Carimbo FISICO, para leitura humana. */
+  readonly consolidadoEm: string;
+}
+
+/** Valida uma recomendacao vinda pela rede antes de aceita-la no lote. */
+export function ehRecomendacaoBloqueio(valor: unknown): valor is RecomendacaoBloqueio {
+  if (typeof valor !== "object" || valor === null) {
+    return false;
+  }
+
+  const campos = valor as Record<string, unknown>;
+  const pacotes = campos["pacotesPorSegundo"];
+  const detectadoPor = campos["detectadoPor"];
+  const lamportDeteccao = campos["lamportDeteccao"];
+
+  return (
+    typeof campos["alertaId"] === "string" &&
+    typeof campos["ipOrigem"] === "string" &&
+    typeof campos["sensorId"] === "string" &&
+    typeof pacotes === "number" &&
+    Number.isFinite(pacotes) &&
+    typeof detectadoPor === "number" &&
+    Number.isInteger(detectadoPor) &&
+    typeof lamportDeteccao === "number" &&
+    Number.isInteger(lamportDeteccao) &&
+    lamportDeteccao >= 0
+  );
+}

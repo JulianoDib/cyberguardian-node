@@ -374,3 +374,88 @@
 - Explicação: o gateway é ancestral causal de tudo e avança 3 por alerta, enquanto os workers avançam 2 por mensagem. O gateway está sempre à frente.
 - Consequência honesta: o `max` está funcionando (os saltos de 0→3, 4→21, 10→18 provam isso), mas um caso em que o relógio **local** domina não aparece nesta topologia. Ele exigiria um processo com mais eventos locais que o carimbo recebido.
 - Não foi forçado artificialmente. Registrado para não afirmar mais do que os dados mostram.
+
+---
+
+## Etapa 5 — R5: Eleição de Líder (Algoritmo do Valentão / Bully)
+
+### 06/09 — Canal de coordenação: TCP com CONEXÃO POR MENSAGEM
+- Contexto: o Bully precisa de um canal entre os workers para ELECTION / OK / COORDINATOR e para a sondagem de vida. Esse canal não existia no sistema.
+- Decisão: **TCP, abrindo uma conexão por mensagem** (abre, envia, recebe a resposta, fecha). Sem pool, sem reconexão, sem estado de conexão.
+- Motivos:
+  1. O grande defeito do TCP em malha entre nós é o gerenciamento de conexões — conexão por mensagem elimina isso por completo.
+  2. Ganha-se o **`ECONNREFUSED`**: ao conectar num processo morto, o sistema operacional responde imediatamente "não há ninguém nessa porta". É evidência **direta** de queda, não um palpite por ausência de resposta.
+  3. O canal é **independente do Kafka**: uma falha do broker não afeta a detecção de queda de worker, e vice-versa.
+  4. Reaproveita o `framing.ts` já escrito e validado na Etapa 2.
+- **RESSALVA PARA A DEFESA — a alternativa mais canônica era UDP.** As implementações de livro-texto do Bully usam UDP, e por bons motivos: sem conexão para gerenciar, cada datagrama já é uma mensagem com fronteira preservada (dispensa framing), latência mínima, e o algoritmo **já tolera perda por desenho** (se um OK se perde, o timeout dispara e há nova eleição). Se perguntarem "por que não UDP?", a resposta honesta é: *"UDP é o mais canônico e teria funcionado; escolhemos TCP porque o `ECONNREFUSED` dá detecção imediata e inequívoca de queda — com UDP só haveria o silêncio, que é ambíguo entre morto, lento e pacote perdido — e porque reaproveitamos o enquadramento já validado."* Não dizer que UDP está errado.
+- Alternativas descartadas:
+  - **Tópico do Kafka** — teria menos código, mas: o Bully precisa de mensagens **dirigidas** (Kafka é difusão); precisa de **timeouts previsíveis** (a latência do consumidor inclui busca, lotes e rebalanceamento, que pode atrasar segundos e fazer a eleição oscilar); exigiria três consumer groups extras; e o mais grave, **acoplaria a detecção de falha à saúde do broker**, impedindo distinguir "worker caiu" de "fila com problema". Além de ser circular usar o Kafka para eleger o líder que coordena o Kafka.
+  - **HTTP/REST** — pilha inteira para trocar mensagens de três campos.
+
+### 06/09 — O OK realizado como RESPOSTA ao ELECTION, na mesma conexão
+- Contexto: no Bully clássico o OK é uma mensagem separada, enviada de volta pelo nó maior.
+- Decisão: como cada mensagem abre a própria conexão, o OK é a **resposta** da requisição ELECTION.
+- Justificativa: as mensagens do algoritmo são exatamente as mesmas; muda apenas como o transporte as materializa. E simplifica a espera pelo OK — ela vira o timeout da própria requisição, em vez de um temporizador separado.
+- Registrado por ser detalhe que um examinador atento pode questionar.
+
+### 06/09 — Descoberta estática da composição do grupo
+- Decisão: tabela fixa em `rede.ts` — worker 1 → porta 5101, worker 2 → 5102, worker 3 → 5103.
+- Justificativa: **não é simplificação, é exigência do Bully.** O algoritmo assume que cada nó conhece a lista completa de participantes e seus IDs, senão não sabe a quem enviar ELECTION. É uma limitação real do algoritmo — o Ring, em comparação, precisa conhecer apenas o próprio sucessor.
+
+### 06/09 — Tempos da detecção de falha e da eleição
+- Sondagem do líder a cada **1000 ms**; timeout de resposta **500 ms**; **3 falhas consecutivas** para declarar o líder morto. Detecção no pior caso: ~3 s.
+- **Direção da sondagem: os seguidores sondam o líder** (e não o líder empurrando heartbeat). Motivo: é o seguidor que precisa detectar a queda, e sondando ele obtém o `ECONNREFUSED` na hora. Se o líder empurrasse, o seguidor só descobriria por silêncio.
+- Três defesas contra falso positivo: (1) as falhas precisam ser **consecutivas** e qualquer resposta bem-sucedida **zera** o contador; (2) margem de ~100× no timeout (500 ms para latência real < 5 ms); (3) como o `ECONNREFUSED` retorna instantaneamente, um líder **morto** acumula as três falhas rápido, enquanto um líder **lento** que ainda responde zera o contador — o mesmo mecanismo distingue os dois casos sem código extra.
+- `TIMEOUT_OK = 1000 ms` e `TIMEOUT_COORDINATOR = 2500 ms`. **A ordem entre eles importa:** o de COORDINATOR precisa ser maior, senão o nó reiniciaria a eleição antes de o nó maior ter tempo de concluir a dele. É erro clássico de implementação de Bully.
+- `setTimeout` encadeado em vez de `setInterval` na sondagem: assim uma sondagem lenta nunca se sobrepõe à próxima.
+
+### 06/09 — Convivência do Bully com o consumo do Kafka no mesmo processo
+- Ambos são I/O assíncrono sobre o mesmo event loop do Node, então os heartbeats continuam fluindo enquanto o `eachMessage` espera o commit.
+- **Risco declarado:** se o processamento fizesse trabalho **síncrono pesado**, bloquearia o event loop e atrasaria os heartbeats — gerando falso positivo de líder morto. No nosso caso o processamento é uma operação de `Map` mais um append pequeno, na casa dos microssegundos. É por isso que a margem do timeout é folgada.
+
+### 06/09 — Lamport nas mensagens de coordenação
+- **ELECTION / OK / COORDINATOR / RECOMENDACAO incrementam** o relógio: são eventos de coordenação com significado causal.
+- **HEARTBEAT / VIVO NÃO incrementam:** sondagem periódica de vida é infraestrutura — mesmo critério que já excluiu o `commitOffsets`. Sem essa exclusão, milhares de heartbeats afogariam os eventos de domínio no log de auditoria.
+- **Um BROADCAST conta como UM evento**, e todos os destinatários recebem o mesmo carimbo. Enviar a mesma mensagem a vários pares é uma única ação do processo.
+- **Ganho inesperado:** o canal de coordenação produziu finalmente o caso em que o **relógio local domina o `max`**, que faltava na Etapa 4 — ex.: `max(local=34, msg=17)+1 = 35`, quando o líder (relógio alto de tanto processar) recebe recomendação de um worker com relógio menor. A demonstração de Lamport agora cobre os dois lados do `max`.
+
+### 06/09 — Separação bully.ts (algoritmo) / coordenacao.ts (transporte)
+- Decisão: dois arquivos. O `bully.ts` fala só de ELECTION/OK/COORDINATOR e sondagem; o `coordenacao.ts` só de sockets e protocolo.
+- Justificativa: na defesa, abrir o `bully.ts` e ver o algoritmo sem ruído de rede.
+- Para o Bully não precisar conhecer consolidação, foi usado um **observador** (`ObservadorBully`) com dois ganchos: `aoReceberRecomendacao` e `aoMudarPapel`. O `worker.ts` faz a ligação.
+
+### 06/09 — Reação a COORDINATOR vindo de um ID MENOR
+- Decisão: se um nó recebe COORDINATOR de alguém com ID menor que o seu, ele **dispara uma nova eleição** em vez de aceitar.
+- Justificativa: é a essência do "valentão" — o maior vivo sempre vence. Sem isso, um nó menor que se elegeu durante uma janela de indisponibilidade permaneceria líder indevidamente.
+
+### 06/09 — Consolidação: RECOMENDACAO dos workers para o líder
+- Contexto: cada worker detecta anomalias apenas na sua partição. O líder precisa reunir as detecções de todos para "consolidar o lote de anomalias".
+- Decisão: ao decidir BLOQUEAR, o worker envia uma `RecomendacaoBloqueio` ao líder pelo canal de coordenação. Se o próprio worker for o líder, a entrega é **local**, sem passar pela rede.
+- Recomendações produzidas enquanto não há líder conhecido (durante uma eleição) são **acumuladas** e despachadas assim que houver líder, com teto de 200 para não crescer sem limite.
+- Falha ao entregar a recomendação **não impede** a confirmação do offset no Kafka: o alerta já foi processado, e o enviador guarda a pendência. Reprocessar a mensagem só geraria recomendação duplicada.
+- Nota honesta: o incremento de Lamport acontece na **tentativa** de envio, não na entrega. O evento de envio ocorreu ainda que a entrega falhe; uma retentativa incrementa de novo. É consistente com o modelo, mas registrado para não haver surpresa.
+
+### 06/09 — "Sem comandos duplicados" em três camadas
+1. **Um só emissor.** O Bully garante um líder; seguidores apenas recomendam. **A ausência de linhas `FIREWALL` nos logs dos seguidores é a prova.**
+2. **Deduplicação por IP dentro do lote.** N recomendações do mesmo atacante viram UM comando, que lista os alertas que o motivaram.
+3. **Conjunto de IPs já bloqueados.** Um lote posterior não reemite comando para IP já bloqueado — a linha `JA BLOQUEADO ... comando SUPRIMIDO` é a evidência.
+- Trava adicional: se uma RECOMENDACAO chega a um nó que **não é** o líder (mensagem atrasada, endereçada a um líder já deposto), ela é **recusada** — assim não entra em dois lotes diferentes.
+- Evidência medida: 6 recomendações de 3 workers → 3 IPs distintos → **3 comandos**. Lote seguinte: 4 recomendações → 2 IPs, ambos já bloqueados → **0 comandos**. Contagem final de linhas `FIREWALL`: worker-1 = 0, worker-2 = 0, worker-3 (líder) = 3.
+
+### 06/09 — Fechamento do lote a cada 5 segundos
+- Decisão: `INTERVALO_CONSOLIDACAO_MS = 5000`.
+- Justificativa: fechar em **lote**, e não a cada recomendação, é justamente o que permite deduplicar por IP. A cada recomendação, cada uma viraria um comando.
+- Um evento de Lamport (`CONSOLIDA`) por lote fechado, compartilhado por todos os `RegistroBloqueio` daquele lote — consistente com a regra de "uma ação lógica, um evento".
+
+### 06/09 — RegistroBloqueio: a terceira entidade
+- Fecha a modelagem mínima exigida pelo escopo: **SensorRede → AlertaAnomalia → RegistroBloqueio**.
+- Campos: `id`, `loteId`, `ipBloqueado`, `emitidoPor` (o worker líder), `lamport` (carimbo do líder ao consolidar), `alertasQueMotivaram` (histórico causal), `quantidadeAlertas`, `consolidadoEm` (físico).
+- O firewall é **simulado**: o comando é uma linha de log, conforme o escopo.
+- Persistir esses registros em primário + réplica é a Etapa 7.
+
+### 06/09 — Bully vs Ring (munição de defesa)
+- **Mensagens:** Bully é O(n²) no pior caso; Ring é O(n), mas sempre duas voltas completas no anel.
+- **Rodadas até eleger:** Bully converge em poucas — o maior vivo se declara quase imediatamente. Ring precisa circular o anel inteiro.
+- **Conhecimento exigido:** Bully precisa de todos os IDs e endereços; Ring só do sucessor — aí o Ring escala melhor.
+- **Nó que morre durante a eleição:** o Bully trata naturalmente por timeout; o Ring precisa pular para o próximo sucessor, o que é mais frágil.
+- Frase: *"Com 3 nós, o custo O(n²) do Bully é irrelevante. O que importa é a convergência: num NIDS, líder ausente significa comando de bloqueio não emitido enquanto o ataque continua, então eleger rápido vale mais que economizar mensagens. O preço é exigir o conhecimento de toda a composição do grupo."*

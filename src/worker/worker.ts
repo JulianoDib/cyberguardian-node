@@ -27,6 +27,8 @@ import { RegistradorAuditoria } from "../compartilhado/auditoria";
 import { criarKafka, TOPICO_ALERTAS } from "../compartilhado/kafka";
 import { ErroDeRelogio, RelogioLamport } from "../compartilhado/lamport";
 import { ehEnvelopeAlerta } from "../compartilhado/tipos";
+import { Bully } from "./bully";
+import { Consolidador, EnviadorDeRecomendacoes } from "./consolidador";
 import { AvaliadorDeBloqueio } from "./regra-bloqueio";
 
 /**
@@ -72,7 +74,12 @@ async function principal(): Promise<void> {
     throw new Error("informe o numero do worker. Ex.: npm run worker -- 1");
   }
 
-  const nome = `worker-${identificador}`;
+  const meuId: number = Number.parseInt(identificador, 10);
+  if (!Number.isInteger(meuId) || meuId < 1) {
+    throw new Error(`id de worker invalido: "${identificador}". Use 1, 2 ou 3.`);
+  }
+
+  const nome = `worker-${meuId}`;
   const log = criarLog(nome);
 
   const kafka = criarKafka(nome);
@@ -94,6 +101,53 @@ async function principal(): Promise<void> {
   const relogio = new RelogioLamport();
   const auditoria = new RegistradorAuditoria(nome);
 
+  /**
+   * ELEICAO DE LIDER (R5).
+   *
+   * Convive com o consumo do Kafka no MESMO processo: ambos sao I/O assincrono
+   * sobre o mesmo event loop, entao os heartbeats continuam fluindo enquanto o
+   * `eachMessage` espera o commit.
+   *
+   * Risco a declarar: se o processamento fizesse trabalho SINCRONO pesado, ele
+   * bloquearia o event loop e atrasaria os heartbeats — gerando falso positivo
+   * de lider morto. No nosso caso o processamento e uma operacao de Map mais um
+   * append pequeno, na casa dos microssegundos. E por isso que a margem do
+   * timeout de sondagem e folgada (500 ms para uma latencia real de < 5 ms).
+   */
+  const bully = new Bully(meuId, relogio, auditoria, log);
+
+  /**
+   * CONSOLIDACAO (R5) — as duas metades do fluxo.
+   *
+   * `consolidador` so trabalha quando ESTE no e o lider; `enviador` manda as
+   * recomendacoes ao lider (ou entrega localmente, se o lider for eu mesmo).
+   */
+  const consolidador = new Consolidador(meuId, relogio, auditoria, log);
+  const enviador = new EnviadorDeRecomendacoes(
+    meuId,
+    bully,
+    consolidador,
+    relogio,
+    auditoria,
+    log
+  );
+
+  bully.observar({
+    aoReceberRecomendacao: (recomendacao) => {
+      consolidador.receber(recomendacao);
+    },
+    aoMudarPapel: (souLider) => {
+      // Assumiu a lideranca -> passa a fechar lotes. Deixou -> para na hora.
+      if (souLider) {
+        consolidador.iniciar();
+      } else {
+        consolidador.parar();
+      }
+      // Recomendacoes acumuladas durante a eleicao saem agora que ha lider.
+      void enviador.despachar();
+    },
+  });
+
   let processadas = 0;
   let bloqueios = 0;
 
@@ -113,6 +167,10 @@ async function principal(): Promise<void> {
   await consumidor.subscribe({ topic: TOPICO_ALERTAS, fromBeginning: true });
   log(`auditoria em ${auditoria.arquivo} | relogio de Lamport iniciado em L=${relogio.valor}`);
   log(`inscrito em "${TOPICO_ALERTAS}" | aguardando atribuicao de particoes...`);
+
+  // Eleicao ANTES de comecar a consumir: o log da eleicao sai limpo, sem se
+  // misturar com o processamento de alertas.
+  await bully.iniciar();
 
   await consumidor.run({
     // >>> ACK MANUAL <<<
@@ -209,9 +267,26 @@ async function principal(): Promise<void> {
         });
 
         if (decisao.severidade === "BLOQUEAR") {
-          // Por enquanto o worker apenas REGISTRA a recomendacao. Consolidar o
-          // lote e emitir o comando unico de bloqueio e papel do lider (R5).
+          // O worker apenas RECOMENDA. Quem consolida o lote e emite o comando
+          // ao firewall e o LIDER — e so ele. Um worker que emitisse comando
+          // por conta propria produziria as duplicatas que o tema proibe.
           log(`${posicao} | >>> RECOMENDA BLOQUEIO de ${valor.payload.ipOrigem} (id=${valor.id})`);
+
+          // Falha ao entregar a recomendacao NAO impede a confirmacao do offset:
+          // o alerta ja foi processado, e o enviador guarda a pendencia para
+          // reenviar. Reprocessar a mensagem so geraria recomendacao duplicada.
+          await enviador
+            .enviar({
+              alertaId: valor.id,
+              ipOrigem: valor.payload.ipOrigem,
+              sensorId: valor.payload.sensorId,
+              pacotesPorSegundo: valor.payload.pacotesPorSegundo,
+              detectadoPor: meuId,
+              lamportDeteccao: lamportProcessa,
+            })
+            .catch((erro: unknown) => {
+              log(`${posicao} | falha ao despachar recomendacao: ${String(erro)}`);
+            });
         }
       } catch (erro: unknown) {
         // ERRO TRANSITORIO: NAO confirma o offset de proposito. A mensagem
@@ -234,8 +309,14 @@ async function principal(): Promise<void> {
   const encerrar = async (): Promise<void> => {
     log(
       `encerrando... processadas=${processadas} bloqueios=${bloqueios} ` +
-        `ips monitorados=${avaliador.ipsMonitorados} | relogio final: L=${relogio.valor}`
+        `ips monitorados=${avaliador.ipsMonitorados} | relogio final: L=${relogio.valor} ` +
+        `| papel: ${bully.souLider ? "LIDER" : `seguidor de ${String(bully.lider)}`} ` +
+        `| bloqueios emitidos: ${consolidador.totalRegistros}`
     );
+    // Fecha o canal de coordenacao: os pares passam a receber ECONNREFUSED
+    // imediatamente, em vez de esperar o timeout de sondagem.
+    consolidador.parar();
+    bully.parar();
     // Sair do grupo avisando o broker faz o Kafka redistribuir as particoes
     // imediatamente, em vez de esperar o tempo de expiracao da sessao.
     await consumidor.disconnect();

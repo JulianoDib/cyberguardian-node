@@ -6,8 +6,8 @@
 
 ## Estado atual
 **Fase:** Desenvolvimento iniciado.
-**Etapa atual:** Etapa 4 (R4/Lamport) CONCLUIDA. Proxima: Etapa 5 (R5 - Eleicao Bully).
-**Última atualização:** 06/09/2026 — sessão de trabalho: Relogios de Lamport no gateway e nos 3 workers, log de auditoria e demonstracao do trade-off vs relogio fisico.
+**Etapa atual:** Etapa 5 (R5/Bully) CONCLUIDA. Proxima: Etapa 6 (R6 - Tolerancia a falhas).
+**Última atualização:** 06/09/2026 — sessão de trabalho: Algoritmo Bully entre os 3 workers + consolidacao do lote pelo lider + RegistroBloqueio.
 
 ## Checklist de etapas
 - [x] Análise do enunciado e divisão em etapas
@@ -57,7 +57,14 @@
   - [x] Ordenacao total deterministica por (lamport, processo)
   - [x] `demonstracoes/ordenar-auditoria.mjs` — as duas ordens + inversoes + cadeias causais
   - [x] **Evidencia:** logs com a aritmetica escrita, ex. `max(local=0, msg=2)+1 = 3`
-- [ ] Etapa 5 — R5: Eleição Bully + líder único consolidador
+- [x] Etapa 5 — R5: Eleição Bully + líder único consolidador — **CONCLUIDA**
+  - [x] `src/worker/coordenacao.ts` — transporte TCP, conexao por mensagem
+  - [x] `src/worker/bully.ts` — ELECTION / OK / COORDINATOR + sondagem de vida
+  - [x] `src/worker/consolidador.ts` — lote do lider + envio de recomendacoes
+  - [x] Descoberta estatica: worker 1/2/3 nas portas 5101/5102/5103
+  - [x] `RegistroBloqueio` — a TERCEIRA entidade (SensorRede -> AlertaAnomalia -> RegistroBloqueio)
+  - [x] **3 cenas testadas:** subida, valentao chegando, morte do lider + reeleicao
+  - [x] **Sem comandos duplicados provado:** FIREWALL no lider = 3, nos seguidores = 0
 - [ ] Etapa 6 — R6: Falhas sem perda + reeleição automática
 - [ ] Etapa 7 — Persistência primário + réplica
 - [ ] Etapa 8 — Integração ponta a ponta + coleta de evidências de log
@@ -82,7 +89,23 @@
 2. Conferir a etapa atual no checklist e o critério de "pronto" dela no 02-PLANO.md.
 3. Perguntar ao aluno como ele quer conduzir a etapa (manual, misto ou delegado) e seguir.
 
-## Notas da última sessão (06/09 — Etapa 4 concluída)
+## Notas da última sessão (06/09 — Etapa 5 concluída)
+- **Eleicao funcionando nas 3 cenas.** Subida: worker-1 sozinho vira lider (ELECTION recusado pelos
+  outros dois). Valentao chegando: worker-3 sobe, nao tem ninguem maior, manda COORDINATOR e os
+  outros abdicam. Morte: matei o worker-3 e em ~3s (3 falhas consecutivas) o worker-2 assumiu.
+- **`RECUSADA` (ECONNREFUSED) validou a escolha do TCP** — o SO afirma que nao ha ninguem na porta,
+  em vez de a gente adivinhar por silencio.
+- **Consolidacao sem duplicatas, medida:** 6 recomendacoes de 3 workers -> 3 IPs distintos -> 3
+  comandos FIREWALL. Lote seguinte: 4 recomendacoes -> 2 IPs ja bloqueados -> 0 comandos
+  (`JA BLOQUEADO ... SUPRIMIDO`). Contagem de linhas FIREWALL: worker-1=0, worker-2=0, worker-3=3.
+  **A ausencia de FIREWALL nos seguidores E a prova de "sem comandos duplicados".**
+- **Bonus para o R4:** o canal de coordenacao produziu o caso em que o relogio LOCAL domina o max
+  (`max(local=34, msg=17)+1 = 35`), que faltava na Etapa 4. A demonstracao de Lamport agora cobre
+  os dois lados.
+- Comandos: `npm run worker -- 1/2/3` (3 terminais, subindo um de cada vez), `npm run gateway`,
+  `npm run sensor -- 15`. Filtros: `grep BULLY`, `grep FIREWALL`, `grep LAMPORT`.
+
+## Notas da sessão anterior (06/09 — Etapa 4 concluída)
 - **A evidencia do R4 esta pronta:** `grep LAMPORT` nos logs mostra a conta em cada linha.
   Exemplo de ouro: `[worker-1] LAMPORT L=3 RECEBE-FILA max(local=0, msg=2)+1 = 3` — o relogio
   pula de 0 para 3, nao para 1, porque aprendeu sobre eventos que o precedem causalmente.
