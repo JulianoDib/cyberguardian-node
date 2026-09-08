@@ -6,8 +6,8 @@
 
 ## Estado atual
 **Fase:** Desenvolvimento iniciado.
-**Etapa atual:** Etapa 5 (R5/Bully) CONCLUIDA. Proxima: Etapa 6 (R6 - Tolerancia a falhas).
-**Última atualização:** 06/09/2026 — sessão de trabalho: Algoritmo Bully entre os 3 workers + consolidacao do lote pelo lider + RegistroBloqueio.
+**Etapa atual:** Etapa 6 (R6/Tolerancia a falhas) CONCLUIDA. Proxima: Etapa 7 (Persistencia primario + replica).
+**Última atualização:** 06/09/2026 — sessão de trabalho: demonstracao do R6 (morte do lider sem perda de mensagem + reeleicao automatica), com numeros conferidos.
 
 ## Checklist de etapas
 - [x] Análise do enunciado e divisão em etapas
@@ -65,7 +65,14 @@
   - [x] `RegistroBloqueio` — a TERCEIRA entidade (SensorRede -> AlertaAnomalia -> RegistroBloqueio)
   - [x] **3 cenas testadas:** subida, valentao chegando, morte do lider + reeleicao
   - [x] **Sem comandos duplicados provado:** FIREWALL no lider = 3, nos seguidores = 0
-- [ ] Etapa 6 — R6: Falhas sem perda + reeleição automática
+- [x] Etapa 6 — R6: Falhas sem perda + reeleição automática — **CONCLUIDA (demonstracao)**
+  - [x] `ATRASO_COMMIT_MS` — instrumentacao de demo, desligada por padrao
+  - [x] `demonstracoes/conferir-entrega.mjs` — reconcilia publicados vs processados
+  - [x] **Metade 1 PROVADA:** 30 publicados, 30 processados distintos, **0 perdidos**
+  - [x] **Metade 2 PROVADA:** lider morto -> deteccao em ~3s -> worker-2 assumiu
+  - [x] Contabilidade do PROPRIO Kafka: LAG 0 nas 3 particoes, 14+8+8 = 30
+  - [x] Sistema continuou operando: novo lider emitiu comando de bloqueio
+  - [x] Limites registrados (broker, split-brain, exactly-once, no travado)
 - [ ] Etapa 7 — Persistência primário + réplica
 - [ ] Etapa 8 — Integração ponta a ponta + coleta de evidências de log
 - [ ] Etapa 9 — README, diagrama, Declaração de IA, e-mail de submissão
@@ -89,7 +96,23 @@
 2. Conferir a etapa atual no checklist e o critério de "pronto" dela no 02-PLANO.md.
 3. Perguntar ao aluno como ele quer conduzir a etapa (manual, misto ou delegado) e seguir.
 
-## Notas da última sessão (06/09 — Etapa 5 concluída)
+## Notas da última sessão (06/09 — Etapa 6 concluída)
+- **Nenhum codigo de producao novo.** O R6 ja estava implementado (ack manual na Etapa 3,
+  reeleicao na Etapa 5). Esta etapa foi coleta de evidencia, como a analise do plano previu.
+- **O numero que fecha o R6:** 30 publicados / 30 processados distintos / **0 perdidos**, com
+  1 reprocessamento. E pelo lado do Kafka: LAG 0 nas 3 particoes, 14+8+8 = 30.
+- **O momento da falha ficou capturado:** 20s apos matar o worker-3, a particao 0 ainda estava
+  atribuida a ele com **LAG 8** (8 mensagens presas). Depois foi redistribuida ao worker-1, que
+  drenou tudo.
+- **A duplicata e a prova:** a mensagem 32d51fdd foi processada pelo worker-3 as 02:26:30 (morto
+  as 02:26:33) e REPROCESSADA pelo worker-1 as 02:27:02. Era a que estava na janela.
+- **Bully (3s) vs Kafka (20-50s)** medido — confirma empiricamente por que a coordenacao nao
+  ficou no Kafka.
+- Limites registrados no diario: queda de broker, split-brain, exactly-once e no travado
+  NAO foram provados. Estao escritos para serem ditos na arguicao.
+- Comandos: `npm run demo:entrega` (reconciliacao) e o `kafka-consumer-groups.sh --describe`.
+
+## Notas da sessão anterior (06/09 — Etapa 5 concluída)
 - **Eleicao funcionando nas 3 cenas.** Subida: worker-1 sozinho vira lider (ELECTION recusado pelos
   outros dois). Valentao chegando: worker-3 sobe, nao tem ninguem maior, manda COORDINATOR e os
   outros abdicam. Morte: matei o worker-3 e em ~3s (3 falhas consecutivas) o worker-2 assumiu.

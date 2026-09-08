@@ -14,7 +14,8 @@
     "gateway": "node --disable-warning=TimeoutNegativeWarning dist/gateway/servidor.js",
     "sensor": "node --disable-warning=TimeoutNegativeWarning dist/sensor/simulador.js",
     "worker": "node --disable-warning=TimeoutNegativeWarning dist/worker/worker.js",
-    "demo:lamport": "node demonstracoes/ordenar-auditoria.mjs"
+    "demo:lamport": "node demonstracoes/ordenar-auditoria.mjs",
+    "demo:entrega": "node demonstracoes/conferir-entrega.mjs"
   },
   "keywords": [],
   "author": "",

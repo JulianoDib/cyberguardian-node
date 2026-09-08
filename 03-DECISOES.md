@@ -459,3 +459,81 @@
 - **Conhecimento exigido:** Bully precisa de todos os IDs e endereços; Ring só do sucessor — aí o Ring escala melhor.
 - **Nó que morre durante a eleição:** o Bully trata naturalmente por timeout; o Ring precisa pular para o próximo sucessor, o que é mais frágil.
 - Frase: *"Com 3 nós, o custo O(n²) do Bully é irrelevante. O que importa é a convergência: num NIDS, líder ausente significa comando de bloqueio não emitido enquanto o ataque continua, então eleger rápido vale mais que economizar mensagens. O preço é exigir o conhecimento de toda a composição do grupo."*
+
+---
+
+## Etapa 6 — R6: Tolerância a Falhas (demonstração e evidências)
+
+### 06/09 — Etapa executada como DEMONSTRAÇÃO, não como implementação
+- Contexto: o código do R6 já existia — ack manual veio na Etapa 3 (antecipado de propósito) e a reeleição automática na Etapa 5.
+- Decisão: esta etapa é coleta de evidência. Nenhum código de produção novo foi escrito; só instrumentação de demonstração e uma ferramenta de conferência.
+- Confirma a análise crítica do plano feita em 06/09: a Etapa 6, como estava escrita no 02-PLANO.md, misturava duas metades que pertenciam às etapas 3 e 5.
+
+### 06/09 — `ATRASO_COMMIT_MS`: instrumentação para tornar a falha demonstrável
+- **Problema encontrado ao planejar:** o worker confirma o offset na linha seguinte ao processamento, então a janela em que uma mensagem está "processada mas não confirmada" dura **microssegundos**. É boa engenharia, mas torna impossível acertar a morte do processo na mão.
+- Decisão: variável de ambiente `ATRASO_COMMIT_MS`, **desligada por padrão**, que insere uma espera entre processar e confirmar.
+- Por que não é trapaça: (a) sem a variável, o comportamento é exatamente o de produção; (b) a espera **simula uma operação lenta entre processar e confirmar**, que é literalmente o que a Etapa 7 vai inserir ali (gravação em banco). Não é um atraso fantasioso — é o futuro daquele trecho.
+- O worker anuncia em log quando a instrumentação está ativa: `>>> [DEMO] ATRASO_COMMIT_MS=3000 ATIVO ... Isto NAO e o comportamento padrao.`
+
+### 06/09 — Medição por DUAS fontes independentes, com a do Kafka como principal
+- **Fonte principal — a contabilidade do próprio broker:** `kafka-consumer-groups.sh --describe`. Se `CURRENT-OFFSET == LOG-END-OFFSET` e `LAG = 0` nas três partições, todo offset produzido foi confirmado. Vale mais que nosso log porque **não é nossa**.
+- **Fonte secundária — reconciliação dos nossos logs de auditoria** (`demonstracoes/conferir-entrega.mjs`): compara os ids publicados pelo gateway (`PUBLICA-FILA`) com os processados pelos workers (`PROCESSA`), apontando faltantes e reprocessados.
+- Decisão de apresentação: **as duplicatas são apresentadas como PROVA DE RECUPERAÇÃO, não como defeito.** Uma mensagem processada duas vezes é a evidência de que ela foi reentregue em vez de perdida. Se não houvesse duplicata nesse cenário, é porque a mensagem teria sumido.
+
+### 06/09 — Morte violenta como método (pior caso, não o mais fácil)
+- Decisão: matar com `Stop-Process -Force` (equivalente a SIGKILL), sem encerramento gracioso, sem sair do grupo de consumidores educadamente.
+- Justificativa: é o cenário mais adverso. Um `Ctrl+C` acionaria o encerramento gracioso que já implementamos (`consumidor.disconnect()`), que avisa o broker e acelera a redistribuição — seria uma demonstração mais fácil e menos convincente.
+
+### 06/09 — RESULTADO MEDIDO (execução de 06/09, tópico recriado do zero)
+Cenário: gateway + 3 workers, o **worker-3 (líder, maior ID) com `ATRASO_COMMIT_MS=3000`**. 30 alertas disparados. Worker-3 morto à força enquanto estava na janela, com uma mensagem processada e não confirmada.
+
+**Contabilidade do Kafka (fonte principal):**
+```
+PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+    0            14              14         0
+    1             8               8         0
+    2             8               8         0
+```
+14 + 8 + 8 = **30 produzidas, 30 confirmadas, LAG zero**.
+
+**Momento da falha capturado** (20 s após a morte, antes da redistribuição):
+```
+PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG   CLIENT-ID
+    0            6              14          8    worker-3  <- MORTO, 8 mensagens presas
+```
+
+**Reconciliação dos logs:**
+```
+PUBLICADOS na fila (gateway)    : 30
+PROCESSADOS distintos (workers) : 30
+FALTANTES (perdidos)            : 0
+REPROCESSADOS (entregues 2x+)   : 1
+```
+A mensagem reprocessada foi `32d51fdd-3770-49e6-9db4-28f5b550f4c8`: processada pelo **worker-3 às 02:26:30.530** (morto às 02:26:33) e reprocessada pelo **worker-1 às 02:27:02.611**. É exatamente a que estava na janela.
+
+**Reeleição (metade 2):** worker-1 detectou `FALHA 1/3 → 2/3 → 3/3 (RECUSADA)`, declarou `LIDER 3 CONSIDERADO MORTO` e disparou eleição; worker-2 respondeu OK, disputou, não achou ninguém maior vivo e assumiu. Detecção em **~3 s**.
+
+**O sistema continuou operando:** o novo líder (worker-2) fechou um lote e emitiu `FIREWALL >>> BLOQUEAR 192.0.2.77`. Contagem final de linhas `FIREWALL`: worker-1 = 0, worker-2 = 1 (depois de assumir), worker-3 = 3 (enquanto era líder). **Em nenhum instante dois workers emitiram comando.**
+
+### 06/09 — Dois detectores de falha, tempos muito diferentes (confirmação empírica)
+| Detector | Tempo medido |
+|---|---|
+| Nosso Bully (sondagem TCP) | **~3 s** |
+| Kafka (session timeout do consumer group) | entre 20 s e ~50 s |
+
+- Aos 20 s após a morte a partição 0 ainda estava atribuída ao worker-3 morto, com LAG 8. Na verificação seguinte já havia sido redistribuída ao worker-1.
+- **Isso confirma empiricamente o argumento usado na Etapa 5 para NÃO colocar a coordenação no Kafka:** os tempos do broker são altos e imprevisíveis demais para sustentar uma eleição de líder.
+- Decisão consciente: **manter o `sessionTimeout` padrão** (30 s) da kafkajs. Reduzir para ~10 s deixaria a demonstração mais rápida, mas mexer em configuração só para a demo ficar bonita é difícil de defender oralmente, e a espera é real.
+
+### 06/09 — LIMITES: o que esta demonstração NÃO prova
+Registrado para ser dito na arguição em vez de ser descoberto pelo avaliador.
+
+- **Queda do broker.** A fila é efêmera por decisão consciente (sem volume, ver Etapa 1). Se o *Kafka* morresse, as mensagens se perderiam. O R6 fala em queda de **nó**, não de broker — mas a distinção precisa estar explícita.
+- **Partição de rede / split-brain.** Tudo roda em `localhost`; não há como simular um particionamento em que dois workers se julguem líderes ao mesmo tempo. **Essa é uma fraqueza real e conhecida do algoritmo Bully** — melhor citá-la você mesmo do que ser pego por ela.
+- **Exactly-once.** Provamos *at-least-once*. A duplicata observada é esperada por desenho, não um bug.
+- **Nó travado (vivo mas sem responder).** Matar o processo produz `ECONNREFUSED`, que é o caso limpo. Um processo *pendurado* seria detectado pelo caminho do `TIMEOUT`, que existe no código (`CausaFalha = "TIMEOUT"`) mas **não foi exercitado** — faltaria ferramenta de suspensão de processo no Windows. Registrado como não demonstrado, em vez de fingido.
+
+### 06/09 — `demonstracoes/conferir-entrega.mjs` versionado
+- Decisão: fica no repositório, mesmo padrão dos demos de framing e de Lamport — fora de `src/`, com cabeçalho declarando que é material de demonstração.
+- Atalho: `npm run demo:entrega`.
+- Justificativa: o README exige evidência de tratamento de falha sem perda de dados. Uma ferramenta que **conta e confere** é evidência mais forte que um print de log.

@@ -40,6 +40,35 @@ import { AvaliadorDeBloqueio } from "./regra-bloqueio";
  */
 const GRUPO_WORKERS = "workers-nids";
 
+/**
+ * INSTRUMENTACAO DE DEMONSTRACAO (R6) — desligada por padrao.
+ *
+ * Insere uma espera ENTRE processar e confirmar o offset. Serve para uma coisa
+ * so: tornar demonstravel a garantia de "nao perder mensagem".
+ *
+ * Por que e necessaria: o codigo normal confirma o offset na linha seguinte ao
+ * processamento, entao a janela em que uma mensagem esta "processada mas nao
+ * confirmada" dura MICROSSEGUNDOS. Isso e bom em producao, mas impossivel de
+ * acertar matando o processo na mao.
+ *
+ * Por que nao e trapaca: (a) sem a variavel de ambiente, o comportamento e
+ * exatamente o de producao; (b) a espera SIMULA uma operacao lenta entre
+ * processar e confirmar — que e literalmente o que a Etapa 7 vai inserir aqui
+ * (gravacao em banco). Nao e um atraso fantasioso, e o futuro deste trecho.
+ *
+ * Uso:  ATRASO_COMMIT_MS=3000 npm run worker -- 3
+ */
+const ATRASO_COMMIT_MS: number = (() => {
+  const bruto = Number.parseInt(process.env["ATRASO_COMMIT_MS"] ?? "0", 10);
+  return Number.isInteger(bruto) && bruto > 0 ? bruto : 0;
+})();
+
+function esperar(ms: number): Promise<void> {
+  return new Promise<void>((resolver) => {
+    setTimeout(resolver, ms);
+  });
+}
+
 function criarLog(nome: string): (mensagem: string) => void {
   return (mensagem: string): void => {
     console.log(`[${nome}] ${mensagem}`);
@@ -167,6 +196,12 @@ async function principal(): Promise<void> {
   await consumidor.subscribe({ topic: TOPICO_ALERTAS, fromBeginning: true });
   log(`auditoria em ${auditoria.arquivo} | relogio de Lamport iniciado em L=${relogio.valor}`);
   log(`inscrito em "${TOPICO_ALERTAS}" | aguardando atribuicao de particoes...`);
+  if (ATRASO_COMMIT_MS > 0) {
+    log(
+      `>>> [DEMO] ATRASO_COMMIT_MS=${ATRASO_COMMIT_MS} ATIVO — janela artificial entre ` +
+        `processar e confirmar o offset. Isto NAO e o comportamento padrao.`
+    );
+  }
 
   // Eleicao ANTES de comecar a consumir: o log da eleicao sai limpo, sem se
   // misturar com o processamento de alertas.
@@ -295,6 +330,18 @@ async function principal(): Promise<void> {
         const detalhe: string = erro instanceof Error ? erro.message : String(erro);
         log(`${posicao} | FALHA no processamento (offset NAO confirmado): ${detalhe}`);
         return;
+      }
+
+      // ---------------------------------------------------------------
+      // Janela de demonstracao: a mensagem esta PROCESSADA e NAO CONFIRMADA.
+      // Matar o processo aqui e o cenario exato que o R6 descreve.
+      // ---------------------------------------------------------------
+      if (ATRASO_COMMIT_MS > 0) {
+        log(
+          `${posicao} | [DEMO] processada, aguardando ${ATRASO_COMMIT_MS} ms antes de confirmar ` +
+            `(janela de perda aberta)`
+        );
+        await esperar(ATRASO_COMMIT_MS);
       }
 
       // ---------------------------------------------------------------
