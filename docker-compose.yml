@@ -106,6 +106,88 @@ services:
         --describe --topic alertas-anomalia
 
   # ===========================================================================
-  # 2. PERSISTENCIA (Etapa 7)
+  # 2. PERSISTENCIA (Etapa 7) — "A Memoria Intacta"
   # ===========================================================================
-  # Os bancos primario e replica entram aqui.
+  # Dois bancos: PRIMARIO (autoritativo) e REPLICA.
+  #
+  # O schema e criado sozinho: a imagem oficial do Postgres executa qualquer
+  # .sql em /docker-entrypoint-initdb.d/ na PRIMEIRA subida. Montando ./banco
+  # ali nos dois containers, "docker compose up -d" ja entrega as tabelas
+  # prontas — sem passo manual, do mesmo jeito que o topico do Kafka.
+
+  postgres-primario:
+    image: postgres:17-alpine
+    container_name: cyberguardian-postgres-primario
+    restart: unless-stopped
+
+    ports:
+      # 5432 = primario. A aplicacao roda fora do Docker e conecta por aqui.
+      - "5432:5432"
+
+    environment:
+      POSTGRES_USER: cyberguardian
+      POSTGRES_PASSWORD: cyberguardian
+      POSTGRES_DB: cyberguardian
+
+    volumes:
+      # Scripts de banco exigidos pelo enunciado, aplicados automaticamente.
+      - ./banco/01-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      # Prepara a streaming replication: papel "replicador" + pg_hba.
+      - ./banco/replicacao/01-primario-replicacao.sh:/docker-entrypoint-initdb.d/02-replicacao.sh:ro
+      # Volume nomeado: aqui a persistencia E o ponto da etapa. Diferente do
+      # Kafka (fila efemera por decisao), o estado consolidado deve sobreviver.
+      # A imagem do Postgres ajusta o dono do volume sozinho — nao ha o problema
+      # de permissao que tivemos com o Kafka na Etapa 1.
+      - dados-primario:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cyberguardian -d cyberguardian"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # REPLICA — standby por STREAMING REPLICATION do PostgreSQL.
+  #
+  # NAO roda initdb e NAO aplica o schema: e uma copia fisica do primario, feita
+  # com pg_basebackup, que sobe em modo somente-leitura consumindo o WAL.
+  # Por isso o entrypoint e substituido (ver banco/replicacao/).
+  # ---------------------------------------------------------------------------
+  postgres-replica:
+    image: postgres:17-alpine
+    container_name: cyberguardian-postgres-replica
+    restart: unless-stopped
+
+    depends_on:
+      postgres-primario:
+        condition: service_healthy
+
+    ports:
+      # 5433 no host para nao colidir com o primario.
+      - "5433:5432"
+
+    environment:
+      POSTGRES_USER: cyberguardian
+      POSTGRES_PASSWORD: cyberguardian
+      POSTGRES_DB: cyberguardian
+      PRIMARIO_HOST: postgres-primario
+      PGPASSWORD_REPLICACAO: replicador
+
+    volumes:
+      - ./banco/replicacao:/replicacao:ro
+      - dados-replica:/var/lib/postgresql/data
+
+    # bash explicito: dispensa o bit de execucao, que o Windows nao preserva.
+    entrypoint: ["/bin/bash", "/replicacao/02-entrypoint-replica.sh"]
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cyberguardian -d cyberguardian"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+volumes:
+  dados-primario:
+  dados-replica:

@@ -23,9 +23,11 @@
   "type": "commonjs",
   "devDependencies": {
     "@types/node": "^26.4.1",
+    "@types/pg": "^8.23.1",
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "kafkajs": "^2.2.4"
+    "kafkajs": "^2.2.4",
+    "pg": "^8.23.0"
   }
 }

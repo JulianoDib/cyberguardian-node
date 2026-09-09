@@ -28,6 +28,7 @@ import {
   enderecoDoWorker,
 } from "../compartilhado/rede";
 import type { RecomendacaoBloqueio, RegistroBloqueio } from "../compartilhado/tipos";
+import { RepositorioBloqueios } from "../compartilhado/repositorio";
 import { ErroDeCoordenacao, enviarMensagem } from "./coordenacao";
 
 // ---------------------------------------------------------------------------
@@ -50,6 +51,10 @@ export class Consolidador {
   private readonly registros: RegistroBloqueio[] = [];
 
   private loteAtual = 0;
+
+  /** Bloqueios que NAO foram emitidos porque a gravacao no primario falhou. */
+  private naoEmitidosPorFalhaDeBanco = 0;
+
   private temporizador: NodeJS.Timeout | null = null;
   private ativo = false;
 
@@ -57,7 +62,8 @@ export class Consolidador {
     private readonly meuId: number,
     private readonly relogio: RelogioLamport,
     private readonly auditoria: RegistradorAuditoria,
-    private readonly log: (mensagem: string) => void
+    private readonly log: (mensagem: string) => void,
+    private readonly repositorio: RepositorioBloqueios
   ) {}
 
   public get totalRegistros(): number {
@@ -73,13 +79,36 @@ export class Consolidador {
     this.pendentes.push(recomendacao);
   }
 
-  /** Passa a fechar lotes periodicamente. Chamado ao assumir a lideranca. */
-  public iniciar(): void {
+  /**
+   * Passa a fechar lotes periodicamente. Chamado ao ASSUMIR a lideranca.
+   *
+   * "A MEMORIA INTACTA": antes de comecar, RECUPERA DO BANCO os IPs ja
+   * bloqueados. Sem isso, um lider que assume apos a morte do anterior comecaria
+   * com o conjunto vazio e reemitiria bloqueios ja decididos — o estado em
+   * memoria morre junto com o processo; o estado persistido nao.
+   */
+  public async iniciar(): Promise<void> {
     if (this.ativo) {
       return;
     }
     this.ativo = true;
     this.log(`LOTE      consolidacao ATIVA (lider) | fechando lote a cada ${INTERVALO_CONSOLIDACAO_MS} ms`);
+
+    try {
+      const ips = await this.repositorio.carregarIpsBloqueados();
+      for (const ip of ips) {
+        this.ipsJaBloqueados.add(ip);
+      }
+      this.log(
+        `LOTE      estado recuperado do banco: ${ips.length} IP(s) ja bloqueado(s) ` +
+          `por lideres anteriores${ips.length > 0 ? ` [${ips.join(", ")}]` : ""}`
+      );
+    } catch (erro: unknown) {
+      const detalhe = erro instanceof Error ? erro.message : String(erro);
+      this.log(`LOTE      NAO consegui recuperar o estado do banco: ${detalhe}`);
+      this.log("LOTE      seguindo com estado vazio — a restricao UNIQUE do banco ainda protege");
+    }
+
     this.agendar();
   }
 
@@ -101,7 +130,7 @@ export class Consolidador {
       return;
     }
     this.temporizador = setTimeout(() => {
-      this.fecharLote();
+      void this.fecharLote();
     }, INTERVALO_CONSOLIDACAO_MS);
   }
 
@@ -109,7 +138,7 @@ export class Consolidador {
    * Fecha o lote: agrupa por IP, emite um comando por IP ainda nao bloqueado,
    * e produz um RegistroBloqueio para cada comando.
    */
-  private fecharLote(): void {
+  private async fecharLote(): Promise<void> {
     if (this.pendentes.length === 0) {
       this.agendar();
       return;
@@ -164,6 +193,25 @@ export class Consolidador {
         consolidadoEm,
       };
 
+      // -------------------------------------------------------------------
+      // PERSISTE ANTES DE EMITIR — integridade antes de acao.
+      //
+      // Se a gravacao no PRIMARIO falhar, o comando NAO e emitido: um bloqueio
+      // sem registro e pior que um bloqueio adiado. As recomendacoes deste IP
+      // ja foram consumidas, mas novos alertas do mesmo atacante voltarao a
+      // gerar recomendacao — a tentativa se repete naturalmente.
+      // -------------------------------------------------------------------
+      const gravacao = await this.repositorio.gravar(registro);
+
+      if (!gravacao.ok) {
+        this.naoEmitidosPorFalhaDeBanco += 1;
+        this.log(
+          `LOTE      ${ip}: gravacao no banco FALHOU — comando NAO emitido ` +
+            `(integridade antes de acao)`
+        );
+        continue;
+      }
+
       this.ipsJaBloqueados.add(ip);
       this.registros.push(registro);
       emitidos += 1;
@@ -171,8 +219,12 @@ export class Consolidador {
       // O firewall e SIMULADO: o comando e esta linha de log.
       this.log(
         `FIREWALL  >>> BLOQUEAR ${ip} (motivado por ${registro.quantidadeAlertas} alerta(s)) ` +
-          `[lote #${this.loteAtual} | registro ${registro.id.slice(0, 8)}]`
+          `[lote #${this.loteAtual} | registro ${registro.id.slice(0, 8)} | persistido]`
       );
+
+      if (gravacao.jaExistia) {
+        this.log(`LOTE      ${ip}: o banco ja tinha este bloqueio (insercao idempotente)`);
+      }
     }
 
     this.auditoria.registrar({
@@ -187,7 +239,10 @@ export class Consolidador {
 
     this.log(
       `LOTE      lote #${this.loteAtual} consolidado | ${emitidos} RegistroBloqueio novo(s) | ` +
-        `total de IPs bloqueados: ${this.ipsJaBloqueados.size}`
+        `total de IPs bloqueados: ${this.ipsJaBloqueados.size}` +
+        (this.naoEmitidosPorFalhaDeBanco > 0
+          ? ` | NAO emitidos por falha de banco: ${this.naoEmitidosPorFalhaDeBanco}`
+          : "")
     );
 
     this.agendar();

@@ -28,6 +28,7 @@ import { criarKafka, TOPICO_ALERTAS } from "../compartilhado/kafka";
 import { ErroDeRelogio, RelogioLamport } from "../compartilhado/lamport";
 import { ehEnvelopeAlerta } from "../compartilhado/tipos";
 import { Bully } from "./bully";
+import { RepositorioBloqueios } from "../compartilhado/repositorio";
 import { Consolidador, EnviadorDeRecomendacoes } from "./consolidador";
 import { AvaliadorDeBloqueio } from "./regra-bloqueio";
 
@@ -151,7 +152,13 @@ async function principal(): Promise<void> {
    * `consolidador` so trabalha quando ESTE no e o lider; `enviador` manda as
    * recomendacoes ao lider (ou entrega localmente, se o lider for eu mesmo).
    */
-  const consolidador = new Consolidador(meuId, relogio, auditoria, log);
+  /**
+   * PERSISTENCIA (Etapa 7). Usada apenas pelo consolidador — ou seja, so tem
+   * efeito quando ESTE worker e o lider.
+   */
+  const repositorio = new RepositorioBloqueios(log);
+
+  const consolidador = new Consolidador(meuId, relogio, auditoria, log, repositorio);
   const enviador = new EnviadorDeRecomendacoes(
     meuId,
     bully,
@@ -168,7 +175,7 @@ async function principal(): Promise<void> {
     aoMudarPapel: (souLider) => {
       // Assumiu a lideranca -> passa a fechar lotes. Deixou -> para na hora.
       if (souLider) {
-        consolidador.iniciar();
+        void consolidador.iniciar();
       } else {
         consolidador.parar();
       }
@@ -190,6 +197,14 @@ async function principal(): Promise<void> {
   consumidor.on(consumidor.events.REBALANCING, () => {
     log(">>> rebalanceamento em andamento (algum worker entrou ou saiu do grupo)");
   });
+
+  try {
+    await repositorio.verificarConexao();
+  } catch (erro: unknown) {
+    const detalhe = erro instanceof Error ? erro.message : String(erro);
+    log(`BANCO  AVISO: nao consegui falar com o banco agora (${detalhe}).`);
+    log("BANCO  o worker segue; a persistencia so e usada se este no virar lider.");
+  }
 
   log("conectando ao Kafka...");
   await consumidor.connect();
@@ -364,6 +379,7 @@ async function principal(): Promise<void> {
     // imediatamente, em vez de esperar o timeout de sondagem.
     consolidador.parar();
     bully.parar();
+    await repositorio.fechar();
     // Sair do grupo avisando o broker faz o Kafka redistribuir as particoes
     // imediatamente, em vez de esperar o tempo de expiracao da sessao.
     await consumidor.disconnect();

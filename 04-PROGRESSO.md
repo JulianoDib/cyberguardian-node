@@ -6,8 +6,8 @@
 
 ## Estado atual
 **Fase:** Desenvolvimento iniciado.
-**Etapa atual:** Etapa 7 (Persistencia) EM ANDAMENTO — infraestrutura ja autossuficiente. Falta: bancos + README.
-**Última atualização:** 09/09/2026 — servico de criacao automatica do topico no docker-compose (fecha pendencia da Etapa 2).
+**Etapa atual:** Etapa 7 (Persistencia) CONCLUIDA. Falta APENAS: Etapa 8 (integracao final) e Etapa 9 (README).
+**Última atualização:** 09/09/2026 — persistencia com REPLICACAO NATIVA do PostgreSQL funcionando, e o novo lider recuperando estado do banco.
 
 ## Checklist de etapas
 - [x] Análise do enunciado e divisão em etapas
@@ -73,7 +73,14 @@
   - [x] Contabilidade do PROPRIO Kafka: LAG 0 nas 3 particoes, 14+8+8 = 30
   - [x] Sistema continuou operando: novo lider emitiu comando de bloqueio
   - [x] Limites registrados (broker, split-brain, exactly-once, no travado)
-- [ ] Etapa 7 — Persistência primário + réplica
+- [x] Etapa 7 — Persistência primário + réplica — **CONCLUIDA**
+  - [x] Dois PostgreSQL 17 no docker-compose (primario 5432, replica 5433)
+  - [x] `banco/01-schema.sql` aplicado automaticamente na primeira subida
+  - [x] **REPLICACAO NATIVA** (streaming replication) — fechou na primeira tentativa
+  - [x] `src/compartilhado/repositorio.ts` — grava SO no primario (replica e somente-leitura)
+  - [x] Politica de falha: banco falhou -> comando NAO emitido (integridade antes de acao)
+  - [x] **Adendo: novo lider recupera os IPs bloqueados do banco ao assumir**
+  - [x] Nucleo provado (bully/coordenacao/lamport/framing/regra/gateway/sensor) INTACTO
 - [ ] Etapa 8 — Integração ponta a ponta + coleta de evidências de log
 - [ ] Etapa 9 — README, diagrama, Declaração de IA, e-mail de submissão
 
@@ -95,7 +102,22 @@
 2. Conferir a etapa atual no checklist e o critério de "pronto" dela no 02-PLANO.md.
 3. Perguntar ao aluno como ele quer conduzir a etapa (manual, misto ou delegado) e seguir.
 
-## Notas da última sessão (09/09 — infraestrutura autossuficiente)
+## Notas da última sessão (09/09 — Etapa 7 concluída)
+- **Replicacao NATIVA funcionou na primeira tentativa** (minha estimativa de risco estava pessimista).
+  `pg_stat_replication` no primario: usename=replicador, state=streaming, sent_lsn = replay_lsn.
+  Na replica: `pg_is_in_recovery()` = t, e INSERT recusado com "read-only transaction".
+- **A aplicacao escreve SO no primario.** A replica se atualiza sozinha pelo WAL. Verificado com
+  carga real de 20 alertas: tabelas identicas nos dois bancos.
+- **"A Memoria Intacta" provada:** matei o lider (worker-3); o worker-2 assumiu e registrou
+  `estado recuperado do banco: 2 IP(s) ja bloqueado(s) [198.51.100.9, 203.0.113.45]`.
+  Alertas seguintes dos mesmos IPs foram SUPRIMIDOS — o estado recuperado e usado de fato.
+- **Decisao do aluno que melhorou o codigo:** cortar o "modo de replicacao" duplo que eu havia
+  comecado. Um caminho so, sem botao de trocar banco na apresentacao.
+- **O aviso da Etapa 3 se resolveu sozinho:** a secao critica e o Map da janela deslizante; o banco
+  entrou no consolidador, que ja trocava o array de pendentes de forma sincrona. Nenhum lock.
+- Comandos de evidencia: ver secao "Como demonstrar" abaixo.
+
+## Notas da sessão anterior (09/09 — infraestrutura autossuficiente)
 - **`docker compose up -d` agora entrega o broker COM o topico pronto.** Nao ha mais passo manual.
   Sequencia observada subindo do zero: kafka Started -> Waiting -> Healthy -> criar-topico Started
   -> Exited(0), em 8 segundos.

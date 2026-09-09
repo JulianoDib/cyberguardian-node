@@ -561,3 +561,72 @@ Registrado para ser dito na arguição em vez de ser descoberto pelo avaliador.
 - Decisão: dividir o arquivo em blocos comentados — `1. MENSAGERIA (R2)` e `2. PERSISTENCIA (Etapa 7)`.
 - Motivo: os bancos primário e réplica da Etapa 7 entram no segundo bloco sem conflitar com o que já está provado, e o arquivo continua legível para quem for avaliar.
 - Registrado no arquivo: o nome do tópico no compose precisa casar com `TOPICO_ALERTAS` em `src/compartilhado/kafka.ts`, e as 3 partições com o mínimo de 3 workers do R3.
+
+---
+
+## Etapa 7 — "A Memória Intacta": persistência e replicação
+
+### 09/09 — PostgreSQL no Docker, aplicação continua por comando
+- Decisão: dois PostgreSQL 17 containerizados (`postgres-primario` na porta 5432, `postgres-replica` na 5433). Gateway, workers e sensor seguem rodando por comando.
+- Justificativa: o enunciado pede "scripts de banco" e "subir a infraestrutura completa (broker, nós e banco)". Postgres no Docker atende isso literalmente e sem custo de instalação para quem for avaliar. O professor não respondeu o e-mail a tempo, então seguimos pela leitura mais literal.
+- Volume nomeado nos dois bancos — **diferente do Kafka**, onde a fila é efêmera por decisão. Aqui a persistência **é** o ponto da etapa. A imagem do Postgres ajusta o dono do volume sozinho, então não houve o problema de permissão que enfrentamos com o Kafka na Etapa 1.
+
+### 09/09 — REPLICAÇÃO NATIVA (streaming replication), e não em nível de aplicação
+- Contexto: minha recomendação inicial foi replicação em nível de aplicação, por causa do prazo (entrega no dia seguinte). Eu havia estimado 3–5 h com cauda imprevisível para a nativa.
+- **Decisão do aluno: replicação nativa.** Motivo: um colega usou nativa, o professor pode comparar, e "não deu tempo" seria uma resposta ruim na arguição.
+- **Resultado: fechou na primeira tentativa**, em bem menos tempo que o estimado. Minha estimativa de risco estava pessimista para este caso.
+- Como funciona: o primário cria um papel `replicador` com atributo REPLICATION e libera `host replication` no `pg_hba.conf`; a réplica substitui o entrypoint por um script que faz `pg_basebackup --write-recovery-conf` do primário e só então delega ao entrypoint oficial. A flag `-R` gera o `standby.signal` e o `primary_conninfo`, que fazem o Postgres subir em modo standby consumindo o WAL.
+- Detalhes que evitaram problemas conhecidos:
+  - `depends_on: postgres-primario: condition: service_healthy` — a réplica não tenta copiar um primário que ainda está subindo.
+  - Laço de retentativa no `pg_basebackup` (até 20 tentativas): o primário aceita conexões normais **antes** de reiniciar com o `pg_hba` que libera replicação.
+  - `chown` + `gosu postgres` antes do basebackup: o ponto de montagem do volume nasce pertencendo ao root, e o Postgres roda como `postgres`.
+  - `entrypoint: ["/bin/bash", "/replicacao/..."]` em vez de depender do bit de execução, que o Windows não preserva.
+  - Terminações de linha LF verificadas nos `.sh` — CRLF quebraria o shebang dentro do container.
+
+### 09/09 — Um caminho só no código: sem "modo de replicação"
+- Contexto: eu havia começado a implementar o repositório com dois modos (`NATIVA` / `APLICACAO`) como rede de segurança, para a troca ser de uma constante caso a nativa falhasse.
+- **Decisão do aluno: remover.** Motivo: o modo duplo adiciona código fora do escopo do enunciado, que teria que ser justificado na defesa, e um "botão de trocar banco" na apresentação é ruim. Um caminho de cada vez; se a nativa falhasse, a abordagem seria **substituída**, não acumulada.
+- Aplicado: `repositorio.ts` reescrito para gravar **apenas no primário**. Nenhum vestígio de modo duplo no código.
+- **A decisão se mostrou acertada:** a nativa funcionou, e o código ficou mais simples do que ficaria com os dois caminhos.
+
+### 09/09 — A aplicação escreve SÓ no primário
+- Decisão: `RepositorioBloqueios` mantém um único pool, apontando para o primário.
+- Justificativa: numa streaming replication a réplica é **somente-leitura**. Verificado empiricamente: um `INSERT` na réplica retorna `ERROR: cannot execute INSERT in a read-only transaction`. Tentar escrever nos dois seria erro de arquitetura.
+- A replicação acontece **na camada do banco**, não na aplicação.
+
+### 09/09 — Política de falha: integridade antes de ação
+- Decisão: se a gravação no banco falhar, o comando de bloqueio **não é emitido**; o consolidador conta o caso em `naoEmitidosPorFalhaDeBanco` e registra em log.
+- Justificativa: um bloqueio sem registro é pior que um bloqueio adiado. As recomendações daquele IP já foram consumidas, mas novos alertas do mesmo atacante voltam a gerar recomendação — a tentativa se repete naturalmente.
+
+### 09/09 — Schema em `banco/01-schema.sql`, aplicado automaticamente
+- A imagem oficial do Postgres executa os `.sql` de `/docker-entrypoint-initdb.d/` na primeira subida. Montando o arquivo ali, `docker compose up -d` já entrega as tabelas prontas — mesma filosofia do serviço `criar-topico`.
+- Cada elemento do schema responde a uma exigência:
+  - `id UUID PRIMARY KEY` — **idempotência**: regravar o mesmo registro é rejeitado pelo banco.
+  - `UNIQUE (ip_bloqueado)` — **integridade**: a segunda linha de defesa contra comando duplicado. A primeira é o conjunto em memória do líder; quando o líder morre, esse conjunto morre junto, e é aqui que o banco segura.
+  - `lamport BIGINT` + índice `(lamport, emitido_por)` — o **histórico causal** consultável, na mesma ordem total determinística definida na Etapa 4.
+  - `alertas_que_motivaram TEXT[]` — rastreabilidade do bloqueio até os alertas de origem.
+  - `CHECK` em `quantidade_alertas` e `lamport`.
+- `INSERT ... ON CONFLICT DO NOTHING` torna a gravação idempotente sem precisar tratar código de erro de violação de unicidade; `rowCount === 0` indica que a linha já existia.
+
+### 09/09 — ADENDO: o novo líder recupera o estado do banco ao assumir
+- Contexto: o conjunto de IPs já bloqueados é estado **em memória** do líder. Quando o líder morre, esse conjunto morre com ele, e o sucessor reemitiria bloqueios já decididos.
+- Decisão: ao assumir a liderança, o consolidador lê `SELECT ip_bloqueado FROM registro_bloqueio` e reconstrói o conjunto.
+- **É o que dá sentido à etapa:** transforma a persistência de "log de escrita" em Memória Intacta de verdade — o estado consolidado sobrevive à morte do nó.
+- Se a leitura falhar, o líder segue com o conjunto vazio e registra o aviso — a restrição `UNIQUE` do banco continua protegendo.
+
+### 09/09 — RESULTADO MEDIDO (execução de 09/09)
+- **Replicação ativa**, pelo lado do primário:
+  `pg_stat_replication` → `usename=replicador | state=streaming | sent_lsn = replay_lsn` (em dia).
+- **Réplica em standby**: `pg_is_in_recovery()` retorna `t`; log mostra `entering standby mode` e `started streaming WAL from primary`.
+- **Réplica somente-leitura**: `INSERT` recusado com `cannot execute INSERT in a read-only transaction`.
+- **Dados idênticos** nos dois bancos após carga real de 20 alertas, com a aplicação escrevendo **apenas no primário**.
+- **Recuperação de estado comprovada:** matei o líder (worker-3) com `Stop-Process -Force`; o worker-2 assumiu e registrou
+  `estado recuperado do banco: 2 IP(s) ja bloqueado(s) por lideres anteriores [198.51.100.9, 203.0.113.45]`.
+  Novos alertas dos mesmos IPs foram **suprimidos** (`comando SUPRIMIDO (sem duplicata)`), provando que o estado recuperado é usado de fato.
+
+### 09/09 — Código tocado: cirúrgico, como planejado
+- **Novo:** `src/compartilhado/repositorio.ts`, `banco/01-schema.sql`, `banco/replicacao/*.sh`.
+- **Alterado:** `src/worker/consolidador.ts` (persiste antes de emitir; recupera estado ao assumir), `src/worker/worker.ts` (instancia o repositório), `docker-compose.yml`, `package.json` (dependência `pg`).
+- **Intactos, como exigido:** `bully.ts`, `coordenacao.ts`, `lamport.ts`, `framing.ts`, `regra-bloqueio.ts`, `servidor.ts`, `simulador.ts`. Todo o núcleo provado nas etapas 1–6 não foi tocado.
+- `pg` é JavaScript puro, sem compilação nativa — mesmo critério que escolheu a `kafkajs` na Etapa 1.
+- **O aviso da Etapa 3 se resolveu sozinho:** eu havia registrado que "se a Etapa 7 inserir gravação em banco na seção crítica, a janela de corrida se abre". A seção crítica é o `Map` da janela deslizante em `regra-bloqueio.ts` — o banco entrou no **consolidador**, que já usa o padrão seguro de trocar o array de pendentes de forma síncrona antes do trabalho lento. Nenhum lock foi necessário.
