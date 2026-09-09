@@ -1,8 +1,19 @@
-# CyberGuardian Node — infraestrutura local (Etapa 1 / R2)
-# Sobe o broker Apache Kafka em modo KRaft (sem Zookeeper).
+# CyberGuardian Node — infraestrutura local
+#
+# Sobe a infraestrutura de apoio. A APLICACAO (gateway, workers, sensor) roda
+# por comando, fora do Docker — ver README.
+#
 # Uso:  docker compose up -d     |     docker compose down
+#
+# Organizacao do arquivo:
+#   1. MENSAGERIA (R2)   — broker Kafka + criacao do topico
+#   2. PERSISTENCIA      — bancos primario e replica (Etapa 7)
 
 services:
+  # ===========================================================================
+  # 1. MENSAGERIA (R2)
+  # ===========================================================================
+
   kafka:
     image: apache/kafka:4.0.0
     container_name: cyberguardian-kafka
@@ -41,6 +52,7 @@ services:
       # --- Proibe criacao automatica de topico ---
       # Se ficasse ligado, um erro de digitacao no nome do topico criaria silenciosamente
       # um topico novo com 1 particao — e ai so 1 dos 3 workers receberia mensagens (quebra o R3).
+      # E por isso que o servico "criar-topico" abaixo existe.
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
 
       # --- Onde o broker grava as mensagens (dentro do container, sem volume) ---
@@ -56,3 +68,44 @@ services:
       timeout: 10s
       retries: 10
       start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Criacao do topico — roda uma vez e encerra.
+  #
+  # Existe porque a auto-criacao de topicos esta DESLIGADA de proposito (acima).
+  # Sem este servico, depois de um "docker compose down" o topico sumiria e o
+  # gateway falharia ao publicar, exigindo um comando manual.
+  #
+  # Detalhes:
+  #  - usa "kafka:9092" (listener INTERNO) porque roda DENTRO da rede do Docker;
+  #  - "--if-not-exists" torna a operacao idempotente: subir de novo nao quebra;
+  #  - o entrypoint da imagem sobe um broker, entao e sobrescrito por "sh -c"
+  #    para executar apenas a ferramenta de topicos;
+  #  - ao final faz um "--describe" para o LOG deste servico servir de evidencia.
+  #
+  # ATENCAO: o nome do topico aqui deve casar com TOPICO_ALERTAS em
+  # src/compartilhado/kafka.ts, e as 3 particoes com o minimo de 3 workers (R3).
+  # ---------------------------------------------------------------------------
+  criar-topico:
+    image: apache/kafka:4.0.0
+    container_name: cyberguardian-criar-topico
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
+        --create --if-not-exists
+        --topic alertas-anomalia
+        --partitions 3
+        --replication-factor 1
+        && echo "--- topico pronto ---"
+        && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
+        --describe --topic alertas-anomalia
+
+  # ===========================================================================
+  # 2. PERSISTENCIA (Etapa 7)
+  # ===========================================================================
+  # Os bancos primario e replica entram aqui.

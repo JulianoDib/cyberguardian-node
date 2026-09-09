@@ -537,3 +537,27 @@ Registrado para ser dito na arguição em vez de ser descoberto pelo avaliador.
 - Decisão: fica no repositório, mesmo padrão dos demos de framing e de Lamport — fora de `src/`, com cabeçalho declarando que é material de demonstração.
 - Atalho: `npm run demo:entrega`.
 - Justificativa: o README exige evidência de tratamento de falha sem perda de dados. Uma ferramenta que **conta e confere** é evidência mais forte que um print de log.
+
+---
+
+## Etapa 7 (preparação) — infraestrutura autossuficiente
+
+### 09/09 — Serviço `criar-topico` no docker-compose (RESOLVE a pendência da Etapa 2)
+- **Pendência que fecha:** registrada na Etapa 2 — como `auto.create.topics.enable=false` (decisão consciente da Etapa 1, para um nome errado não criar silenciosamente um tópico de 1 partição e quebrar o R3), depois de um `docker compose down` o tópico sumia e o gateway falhava ao publicar. Exigia um comando manual que o professor não teria como adivinhar.
+- **Decisão:** um serviço no `docker-compose.yml` que espera o Kafka ficar `healthy`, cria o tópico e encerra.
+- **Detalhes de implementação e o porquê de cada um:**
+  - `depends_on: kafka: condition: service_healthy` — usa o healthcheck que já existia desde a Etapa 1. Sem isso, o serviço tentaria criar o tópico num broker ainda subindo.
+  - `--bootstrap-server kafka:9092` — o listener **INTERNO**, porque este serviço roda **dentro** da rede do Docker. É o duplo listener da Etapa 1 rendendo dividendos: o mesmo broker atende `kafka:9092` para containers e `localhost:29092` para os processos Node no Windows.
+  - `--if-not-exists` — torna a operação **idempotente**. Subir de novo não quebra nem recria.
+  - `entrypoint: ["/bin/sh", "-c"]` — **necessário**: o entrypoint padrão da imagem `apache/kafka` sobe um broker. Sem sobrescrever, este serviço tentaria iniciar um segundo Kafka em vez de rodar a ferramenta de tópicos.
+  - `restart: "no"` — é um serviço de execução única; sem isso o Docker o reiniciaria em laço após o encerramento normal.
+  - Ao final executa um `--describe`, para o **log do próprio serviço** servir de evidência de que o tópico nasceu com 3 partições.
+- **Nenhuma linha de código da aplicação foi tocada.** Só `docker-compose.yml`.
+- **Verificação feita:** `docker compose down` seguido de `docker compose up -d` a partir do zero. Sequência observada: `kafka Started → Waiting → Healthy → criar-topico Started → Exited (0)`, em 8 segundos. Log do serviço mostrou `Created topic alertas-anomalia` e `PartitionCount: 3`.
+- **Idempotência verificada:** segunda execução de `docker compose up -d` terminou com exit 0 e o **mesmo `TopicId`** — ou seja, não recriou o tópico nem falhou.
+- **Teste de fumaça:** gateway + sensor com 3 alertas contra o tópico recém-criado, 3 ACKs, zero erros, sem nenhum passo manual.
+
+### 09/09 — `docker-compose.yml` reorganizado em seções
+- Decisão: dividir o arquivo em blocos comentados — `1. MENSAGERIA (R2)` e `2. PERSISTENCIA (Etapa 7)`.
+- Motivo: os bancos primário e réplica da Etapa 7 entram no segundo bloco sem conflitar com o que já está provado, e o arquivo continua legível para quem for avaliar.
+- Registrado no arquivo: o nome do tópico no compose precisa casar com `TOPICO_ALERTAS` em `src/compartilhado/kafka.ts`, e as 3 partições com o mínimo de 3 workers do R3.

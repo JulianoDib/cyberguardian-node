@@ -6,8 +6,8 @@
 
 ## Estado atual
 **Fase:** Desenvolvimento iniciado.
-**Etapa atual:** Etapa 6 (R6/Tolerancia a falhas) CONCLUIDA. Proxima: Etapa 7 (Persistencia primario + replica).
-**Última atualização:** 06/09/2026 — sessão de trabalho: demonstracao do R6 (morte do lider sem perda de mensagem + reeleicao automatica), com numeros conferidos.
+**Etapa atual:** Etapa 7 (Persistencia) EM ANDAMENTO — infraestrutura ja autossuficiente. Falta: bancos + README.
+**Última atualização:** 09/09/2026 — servico de criacao automatica do topico no docker-compose (fecha pendencia da Etapa 2).
 
 ## Checklist de etapas
 - [x] Análise do enunciado e divisão em etapas
@@ -78,10 +78,9 @@
 - [ ] Etapa 9 — README, diagrama, Declaração de IA, e-mail de submissão
 
 ## Pendências técnicas em aberto
-- [ ] **Recriar o tópico após `docker compose down`.** Com `auto.create.topics.enable=false`, o tópico
-  não volta sozinho e o gateway falha ao publicar. Precisa entrar no guia do README (Etapa 9) ou ser
-  automatizado no docker-compose. Comando atual:
-  `docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --create --topic alertas-anomalia --partitions 3 --replication-factor 1 --bootstrap-server localhost:9092`
+- [x] ~~Recriar o tópico após `docker compose down`~~ — **RESOLVIDO em 09/09**: serviço `criar-topico`
+  no docker-compose cria o tópico sozinho (espera o Kafka ficar healthy, `--if-not-exists`, encerra).
+  Verificado do zero e idempotente. Nenhuma linha de código da aplicação foi tocada.
 - [ ] `src/index.ts` ainda é o arquivo placeholder da Etapa 0; remover quando não fizer mais falta.
 
 ## Pendências externas (não dependem de código)
@@ -96,7 +95,18 @@
 2. Conferir a etapa atual no checklist e o critério de "pronto" dela no 02-PLANO.md.
 3. Perguntar ao aluno como ele quer conduzir a etapa (manual, misto ou delegado) e seguir.
 
-## Notas da última sessão (06/09 — Etapa 6 concluída)
+## Notas da última sessão (09/09 — infraestrutura autossuficiente)
+- **`docker compose up -d` agora entrega o broker COM o topico pronto.** Nao ha mais passo manual.
+  Sequencia observada subindo do zero: kafka Started -> Waiting -> Healthy -> criar-topico Started
+  -> Exited(0), em 8 segundos.
+- Idempotente: segunda subida terminou exit 0 com o MESMO TopicId (nao recriou).
+- Teste de fumaça: gateway + sensor com 3 alertas, 3 ACKs, zero erros.
+- `docker-compose.yml` reorganizado em secoes (MENSAGERIA / PERSISTENCIA) para os bancos da
+  Etapa 7 entrarem sem conflitar.
+- **Decisao de escopo tomada hoje:** NAO containerizar a aplicacao. Gateway/workers/sensor
+  continuam por comando; so Kafka (e os bancos) no Docker. Motivos no 03-DECISOES.md.
+
+## Notas da sessão anterior (06/09 — Etapa 6 concluída)
 - **Nenhum codigo de producao novo.** O R6 ja estava implementado (ack manual na Etapa 3,
   reeleicao na Etapa 5). Esta etapa foi coleta de evidencia, como a analise do plano previu.
 - **O numero que fecha o R6:** 30 publicados / 30 processados distintos / **0 perdidos**, com
