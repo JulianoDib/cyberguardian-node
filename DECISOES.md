@@ -36,6 +36,50 @@
 - Decisão: Claude Code executa; aluno calibra etapa por etapa o quanto faz manualmente. Etapas mecânicas (setup, boilerplate) podem ser totalmente delegadas. R4 (Lamport) e R5 (Bully) recebem atenção de entendimento prioritária por serem os alvos prováveis da arguição.
 - Impacto: documentação 100% delegada ao Claude (Etapa 9). Registro fiel do uso de IA neste diário.
 
+> **Nota de fechamento, escrita em 09/09 com o projeto concluído.**
+>
+> A entrada acima foi escrita em 05/09, antes de o desenvolvimento começar, e descrevia uma
+> intenção. O método efetivamente praticado foi mais restritivo do que "delegar etapas
+> mecânicas", e a entrada fica registrada como plano inicial, não como descrição do que houve.
+>
+> Como funcionou na prática: **nenhuma etapa teve código escrito antes de o grupo aprovar o
+> desenho.** Cada etapa começou com uma proposta apresentada em texto, com alternativas e
+> custos, e só avançou depois de aprovação explícita. Foram aprovados dessa forma, entre
+> outros, o formato do enquadramento (prefixo de tamanho contra delimitador), o momento do
+> envio do ACK, a decisão de não usar mutex nos workers, os tempos do heartbeat e da eleição,
+> e quais eventos incrementam o relógio de Lamport.
+>
+> Em vários pontos o grupo decidiu de forma **diferente da recomendação apresentada**:
+>
+> * **Replicação (Etapa 7).** A recomendação era usar replicação em nível de aplicação, por
+>   causa do prazo, com estimativa de 3 a 5 horas e risco alto para a replicação nativa. O
+>   grupo optou pela nativa do PostgreSQL, argumentando que "não deu tempo" seria uma resposta
+>   ruim na arguição. A nativa funcionou na primeira tentativa, e a estimativa de risco
+>   apresentada estava pessimista.
+> * **Modo duplo de replicação.** Havia sido iniciada uma implementação com dois modos
+>   selecionáveis, como rede de segurança. O grupo mandou remover, por adicionar código fora
+>   do escopo do enunciado e por não querer um seletor de banco na apresentação. O código
+>   final ficou mais simples por causa disso.
+> * **Containerização da aplicação.** O grupo levantou a dúvida, pediu análise técnica com
+>   riscos e prazos, e decidiu manter apenas a infraestrutura no Docker depois de avaliar.
+> * **Granularidade do trabalho.** Na Etapa 5, a mais complexa, o grupo determinou que a
+>   implementação fosse quebrada em pedaços menores que o normal: primeiro a eleição, com
+>   parada para verificação, e só depois a consolidação do lote.
+> * **Preservação do núcleo.** Na Etapa 7 o grupo impôs que `bully.ts`, `coordenacao.ts`,
+>   `lamport.ts`, `framing.ts`, `regra-bloqueio.ts`, `servidor.ts` e `simulador.ts` não fossem
+>   tocados, por já estarem demonstrados.
+> * **Exigências de método.** O grupo determinou que problemas fossem comunicados de imediato
+>   em vez de contornados em silêncio, e que resultados de demonstração jamais fossem
+>   apresentados como espontâneos se tivessem sido induzidos.
+>
+> Sobre a documentação: o README foi **redigido pela ferramenta a partir das evidências
+> coletadas nas execuções reais**, e revisado pelo grupo. Na revisão, o grupo apontou cinco
+> lacunas no guia de execução (falta do `git clone` e do `cd`, necessidade de o Docker Desktop
+> estar aberto, espera até os serviços ficarem `healthy`, lista de portas livres e tratamento
+> de processos remanescentes) e exigiu a verificação empírica de duas afirmações do texto
+> (o segundo argumento do simulador e as versões declaradas na tabela de requisitos). As
+> lacunas foram corrigidas e as afirmações conferidas na máquina antes da entrega.
+
 ### 05/09 — Execução local, sem nada além do escopo
 - Decisão: rodar tudo local via docker-compose; nenhuma feature fora do 01-ESCOPO.md (ver seção "Fora de escopo").
 - Impacto: qualquer sugestão de melhoria extra deve ser recusada ou anotada aqui como "consciente e descartada".

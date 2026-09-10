@@ -27,3 +27,10 @@ Desktop.ini
 .vscode/*
 !.vscode/extensions.json
 .idea/
+
+# Documentos internos de trabalho: ficam na maquina, fora do repositorio.
+# O que interessa ao avaliador esta no README.md e no DECISOES.md.
+CLAUDE.md
+01-ESCOPO.md
+02-PLANO.md
+04-PROGRESSO.md
